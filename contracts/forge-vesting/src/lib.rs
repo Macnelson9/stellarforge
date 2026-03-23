@@ -77,13 +77,33 @@ pub struct ForgeVesting;
 impl ForgeVesting {
     /// Initialize a new vesting schedule.
     ///
+    /// Sets up the vesting configuration and records the current ledger timestamp
+    /// as the start time. Must be called exactly once; subsequent calls return
+    /// [`VestingError::AlreadyInitialized`]. Requires authorization from `admin`.
+    ///
     /// # Parameters
-    /// - `token`: SPL token contract address
-    /// - `beneficiary`: Address that receives vested tokens
-    /// - `admin`: Address that can cancel vesting
-    /// - `total_amount`: Total tokens to vest
-    /// - `cliff_seconds`: Seconds before first unlock
-    /// - `duration_seconds`: Total vesting duration
+    /// - `token` — Address of the Soroban token contract whose tokens are being vested.
+    /// - `beneficiary` — Address that will receive tokens as they vest.
+    /// - `admin` — Address authorized to cancel the vesting schedule.
+    /// - `total_amount` — Total number of tokens (in the token's smallest unit) to vest.
+    ///   Must be greater than zero.
+    /// - `cliff_seconds` — Number of seconds after `start_time` before any tokens unlock.
+    ///   Must be ≤ `duration_seconds`.
+    /// - `duration_seconds` — Total length of the vesting schedule in seconds. Must be > 0.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or a [`VestingError`] variant on failure.
+    ///
+    /// # Errors
+    /// - [`VestingError::AlreadyInitialized`] — Contract has already been initialized.
+    /// - [`VestingError::InvalidConfig`] — `total_amount` ≤ 0, `duration_seconds` == 0,
+    ///   or `cliff_seconds` > `duration_seconds`.
+    ///
+    /// # Example
+    /// ```text
+    /// // Vest 1 000 000 tokens over 1000 s with a 100 s cliff.
+    /// client.initialize(&token, &beneficiary, &admin, &1_000_000, &100, &1000);
+    /// ```
     pub fn initialize(
         env: Env,
         token: Address,
@@ -129,6 +149,25 @@ impl ForgeVesting {
     }
 
     /// Claim all currently vested and unclaimed tokens.
+    ///
+    /// Computes the amount vested up to the current ledger timestamp, subtracts
+    /// previously claimed tokens, and transfers the remainder to the beneficiary.
+    /// Requires authorization from the beneficiary.
+    ///
+    /// # Returns
+    /// `Ok(amount)` — the number of tokens transferred on this call.
+    ///
+    /// # Errors
+    /// - [`VestingError::NotInitialized`] — `initialize` has not been called.
+    /// - [`VestingError::Cancelled`] — The vesting schedule was cancelled by the admin.
+    /// - [`VestingError::CliffNotReached`] — Current time is before `start_time + cliff_seconds`.
+    /// - [`VestingError::NothingToClaim`] — All vested tokens have already been claimed.
+    ///
+    /// # Example
+    /// ```text
+    /// // After the cliff has passed:
+    /// let claimed = client.claim(); // returns tokens vested so far
+    /// ```
     pub fn claim(env: Env) -> Result<i128, VestingError> {
         let config: VestingConfig = env
             .storage()
@@ -176,8 +215,24 @@ impl ForgeVesting {
         Ok(claimable)
     }
 
-    /// Cancel vesting. Returns unvested tokens to admin.
-    /// Only callable by admin.
+    /// Cancel the vesting schedule and return unvested tokens to the admin.
+    ///
+    /// Computes how many tokens have vested (or been claimed) at the current ledger
+    /// timestamp and transfers the remainder back to `admin`. Once cancelled, neither
+    /// `claim` nor `cancel` can be called again. Requires authorization from `admin`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// - [`VestingError::NotInitialized`] — `initialize` has not been called.
+    /// - [`VestingError::Cancelled`] — The schedule is already cancelled.
+    ///
+    /// # Example
+    /// ```text
+    /// // Admin decides to terminate the schedule early:
+    /// client.cancel(); // unvested tokens are returned to admin
+    /// ```
     pub fn cancel(env: Env) -> Result<(), VestingError> {
         let mut config: VestingConfig = env
             .storage()
@@ -212,7 +267,30 @@ impl ForgeVesting {
         Ok(())
     }
 
-    /// Get current vesting status for the beneficiary.
+    /// Return a snapshot of the current vesting status.
+    ///
+    /// Reads the ledger timestamp and computes vested, claimed, and claimable
+    /// amounts without modifying any state. Safe to call by anyone.
+    ///
+    /// # Returns
+    /// `Ok(`[`VestingStatus`]`)` containing:
+    /// - `total_amount` — Total tokens in the schedule.
+    /// - `claimed` — Tokens already transferred to the beneficiary.
+    /// - `vested` — Tokens unlocked so far (including already claimed).
+    /// - `claimable` — Tokens available to claim right now (`vested - claimed`).
+    /// - `cliff_reached` — `true` if the cliff timestamp has passed.
+    /// - `fully_vested` — `true` if the full duration has elapsed.
+    ///
+    /// # Errors
+    /// - [`VestingError::NotInitialized`] — `initialize` has not been called.
+    ///
+    /// # Example
+    /// ```text
+    /// let status = client.get_status();
+    /// if status.cliff_reached {
+    ///     println!("Claimable: {}", status.claimable);
+    /// }
+    /// ```
     pub fn get_status(env: Env) -> Result<VestingStatus, VestingError> {
         let config: VestingConfig = env
             .storage()
@@ -238,7 +316,23 @@ impl ForgeVesting {
         })
     }
 
-    /// Get the full vesting configuration.
+    /// Return the full vesting configuration set at initialization.
+    ///
+    /// Exposes all fields of [`VestingConfig`] including token, beneficiary, admin,
+    /// amounts, timing parameters, and cancellation status. Read-only; does not
+    /// modify state.
+    ///
+    /// # Returns
+    /// `Ok(`[`VestingConfig`]`)` with the stored configuration.
+    ///
+    /// # Errors
+    /// - [`VestingError::NotInitialized`] — `initialize` has not been called.
+    ///
+    /// # Example
+    /// ```text
+    /// let config = client.get_config();
+    /// println!("Beneficiary: {:?}", config.beneficiary);
+    /// ```
     pub fn get_config(env: Env) -> Result<VestingConfig, VestingError> {
         env.storage()
             .instance()
