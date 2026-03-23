@@ -76,14 +76,29 @@ pub struct MultisigContract;
 impl MultisigContract {
     /// Initialize the multisig treasury.
     ///
+    /// Stores the owner list, approval threshold, and timelock delay. Must be
+    /// called exactly once before any other function. Does not require auth —
+    /// the deployer is responsible for calling this immediately after deployment.
+    ///
     /// # Parameters
-    /// - `owners`: List of owner addresses.
-    /// - `threshold`: Minimum approvals required (N-of-M).
-    /// - `timelock_delay`: Seconds to wait after approval before execution.
+    /// - `owners` — List of addresses that are permitted to propose, vote, and execute.
+    /// - `threshold` — Minimum number of approvals required to pass a proposal (N in N-of-M).
+    ///   Must be ≥ 1 and ≤ `owners.len()`.
+    /// - `timelock_delay` — Seconds that must elapse after a proposal reaches the approval
+    ///   threshold before it can be executed. Use `0` for no delay.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
     ///
     /// # Errors
-    /// - `MultisigError::AlreadyInitialized` if already set up.
-    /// - `MultisigError::InvalidThreshold` if threshold > owners count.
+    /// - [`MultisigError::AlreadyInitialized`] — Contract has already been initialized.
+    /// - [`MultisigError::InvalidThreshold`] — `threshold` is 0 or exceeds `owners.len()`.
+    ///
+    /// # Example
+    /// ```text
+    /// // 2-of-3 multisig with a 3600 s (1 h) timelock
+    /// client.initialize(&vec![&env, owner_a, owner_b, owner_c], &2, &3600);
+    /// ```
     pub fn initialize(
         env: Env,
         owners: Vec<Address>,
@@ -108,12 +123,27 @@ impl MultisigContract {
 
     /// Propose a token transfer from the treasury.
     ///
+    /// Creates a new [`Proposal`] and automatically records the proposer's approval.
+    /// The returned ID is used to reference this proposal in subsequent `approve`,
+    /// `reject`, and `execute` calls. Requires authorization from `proposer`.
+    ///
+    /// # Parameters
+    /// - `proposer` — An owner address submitting the proposal.
+    /// - `to` — Destination address that will receive the tokens if executed.
+    /// - `token` — Address of the Soroban token contract to transfer from.
+    /// - `amount` — Number of tokens (in the token's smallest unit) to transfer. Must be > 0.
+    ///
     /// # Returns
-    /// The proposal ID.
+    /// `Ok(proposal_id)` — the unique ID assigned to the new proposal.
     ///
     /// # Errors
-    /// - `MultisigError::Unauthorized` if caller is not an owner.
-    /// - `MultisigError::InvalidAmount` if amount is zero.
+    /// - [`MultisigError::Unauthorized`] — `proposer` is not in the owner list.
+    /// - [`MultisigError::InvalidAmount`] — `amount` is ≤ 0.
+    ///
+    /// # Example
+    /// ```text
+    /// let id = client.propose(&owner, &recipient, &token, &500_000);
+    /// ```
     pub fn propose(
         env: Env,
         proposer: Address,
@@ -159,12 +189,31 @@ impl MultisigContract {
         Ok(proposal_id)
     }
 
-    /// Approve a proposal. If threshold is reached, starts the timelock.
+    /// Approve a proposal.
+    ///
+    /// Records `owner`'s approval on the given proposal. If the total approval count
+    /// reaches the configured threshold for the first time, the timelock countdown
+    /// begins by storing the current ledger timestamp in `approved_at`.
+    /// Requires authorization from `owner`.
+    ///
+    /// # Parameters
+    /// - `owner` — An owner address casting the approval vote.
+    /// - `proposal_id` — ID of the proposal to approve.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
     ///
     /// # Errors
-    /// - `MultisigError::Unauthorized` if caller is not an owner.
-    /// - `MultisigError::AlreadyVoted` if caller already voted.
-    /// - `MultisigError::AlreadyExecuted` if already executed.
+    /// - [`MultisigError::Unauthorized`] — `owner` is not in the owner list.
+    /// - [`MultisigError::ProposalNotFound`] — No proposal exists with `proposal_id`.
+    /// - [`MultisigError::AlreadyVoted`] — `owner` has already approved or rejected this proposal.
+    /// - [`MultisigError::AlreadyExecuted`] — The proposal has already been executed.
+    /// - [`MultisigError::AlreadyCancelled`] — The proposal has been cancelled.
+    ///
+    /// # Example
+    /// ```text
+    /// client.approve(&owner_b, &proposal_id);
+    /// ```
     pub fn approve(env: Env, owner: Address, proposal_id: u64) -> Result<(), MultisigError> {
         owner.require_auth();
         Self::require_owner(&env, &owner)?;
@@ -201,9 +250,28 @@ impl MultisigContract {
 
     /// Reject a proposal.
     ///
+    /// Records `owner`'s rejection on the given proposal. A rejected proposal can
+    /// no longer reach the approval threshold once enough owners have rejected it,
+    /// though the contract does not automatically cancel it.
+    /// Requires authorization from `owner`.
+    ///
+    /// # Parameters
+    /// - `owner` — An owner address casting the rejection vote.
+    /// - `proposal_id` — ID of the proposal to reject.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
     /// # Errors
-    /// - `MultisigError::Unauthorized` if caller is not an owner.
-    /// - `MultisigError::AlreadyVoted` if caller already voted.
+    /// - [`MultisigError::Unauthorized`] — `owner` is not in the owner list.
+    /// - [`MultisigError::ProposalNotFound`] — No proposal exists with `proposal_id`.
+    /// - [`MultisigError::AlreadyVoted`] — `owner` has already approved or rejected this proposal.
+    /// - [`MultisigError::AlreadyExecuted`] — The proposal has already been executed.
+    ///
+    /// # Example
+    /// ```text
+    /// client.reject(&owner_c, &proposal_id);
+    /// ```
     pub fn reject(env: Env, owner: Address, proposal_id: u64) -> Result<(), MultisigError> {
         owner.require_auth();
         Self::require_owner(&env, &owner)?;
@@ -229,12 +297,33 @@ impl MultisigContract {
         Ok(())
     }
 
-    /// Execute an approved proposal after the timelock delay.
+    /// Execute an approved proposal after the timelock delay has elapsed.
+    ///
+    /// Transfers the proposed token amount from the contract's treasury balance to
+    /// the proposal's `to` address. The proposal must have reached the approval
+    /// threshold and the configured `timelock_delay` must have passed since
+    /// `approved_at`. Requires authorization from `executor`.
+    ///
+    /// # Parameters
+    /// - `executor` — An owner address triggering execution.
+    /// - `proposal_id` — ID of the proposal to execute.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
     ///
     /// # Errors
-    /// - `MultisigError::InsufficientApprovals` if threshold not reached.
-    /// - `MultisigError::TimelockNotElapsed` if timelock is still active.
-    /// - `MultisigError::AlreadyExecuted` if already executed.
+    /// - [`MultisigError::Unauthorized`] — `executor` is not in the owner list.
+    /// - [`MultisigError::ProposalNotFound`] — No proposal exists with `proposal_id`.
+    /// - [`MultisigError::AlreadyExecuted`] — The proposal has already been executed.
+    /// - [`MultisigError::AlreadyCancelled`] — The proposal has been cancelled.
+    /// - [`MultisigError::InsufficientApprovals`] — Threshold has not been reached yet.
+    /// - [`MultisigError::TimelockNotElapsed`] — The timelock delay has not fully passed.
+    ///
+    /// # Example
+    /// ```text
+    /// // After timelock has elapsed:
+    /// client.execute(&owner_a, &proposal_id);
+    /// ```
     pub fn execute(env: Env, executor: Address, proposal_id: u64) -> Result<(), MultisigError> {
         executor.require_auth();
         Self::require_owner(&env, &executor)?;
@@ -280,14 +369,41 @@ impl MultisigContract {
         Ok(())
     }
 
-    /// Get a proposal by ID.
+    /// Return a proposal by its ID.
+    ///
+    /// Read-only; does not modify state. Returns `None` if no proposal exists
+    /// with the given ID.
+    ///
+    /// # Parameters
+    /// - `proposal_id` — The ID returned by [`propose`](Self::propose).
+    ///
+    /// # Returns
+    /// `Some(`[`Proposal`]`)` if found, `None` otherwise.
+    ///
+    /// # Example
+    /// ```text
+    /// if let Some(p) = client.get_proposal(&id) {
+    ///     println!("approvals: {}", p.approvals.len());
+    /// }
+    /// ```
     pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
     }
 
-    /// Get list of owners.
+    /// Return the list of authorized owner addresses.
+    ///
+    /// Read-only; returns an empty `Vec` if the contract has not been initialized.
+    ///
+    /// # Returns
+    /// A [`Vec<Address>`] of all current owners.
+    ///
+    /// # Example
+    /// ```text
+    /// let owners = client.get_owners();
+    /// assert_eq!(owners.len(), 3);
+    /// ```
     pub fn get_owners(env: Env) -> Vec<Address> {
         env.storage()
             .instance()
@@ -295,7 +411,17 @@ impl MultisigContract {
             .unwrap_or(Vec::new(&env))
     }
 
-    /// Get the approval threshold.
+    /// Return the current approval threshold (N in N-of-M).
+    ///
+    /// Read-only; returns `0` if the contract has not been initialized.
+    ///
+    /// # Returns
+    /// The minimum number of owner approvals required to pass a proposal.
+    ///
+    /// # Example
+    /// ```text
+    /// let threshold = client.get_threshold(); // e.g. 2 for a 2-of-3 setup
+    /// ```
     pub fn get_threshold(env: Env) -> u32 {
         env.storage()
             .instance()
