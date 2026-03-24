@@ -238,7 +238,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
-        Env, Symbol, TryFromVal,
+        Env, Symbol, TryFromVal, IntoVal,
     };
 
     fn setup(env: &Env) -> (Address, ForgeOracleClient) {
@@ -264,6 +264,56 @@ mod tests {
 
         assert_eq!(data.price, 11_000_000);
         assert_eq!(data.updated_at, 1000);
+    }
+
+    #[test]
+    fn test_non_admin_submit_price_rejected() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let non_admin = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, ForgeOracle);
+        let client = ForgeOracleClient::new(&env, &contract_id);
+
+        // Setup: Mock auth for admin so initialization succeeds
+        env.mock_auths(&[
+            soroban_sdk::testutils::MockAuth {
+                address: &admin,
+                invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (&admin, 3600u64).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }
+        ]);
+        client.initialize(&admin, &3600);
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+
+        // Mock auth for a non-admin to simulate unauthorized invocation
+        env.mock_auths(&[
+            soroban_sdk::testutils::MockAuth {
+                address: &non_admin,
+                invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "submit_price",
+                    args: (&base, &quote, 10_000_000i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }
+        ]);
+
+        // Task 1 & 2: Test that a non-admin address calling submit_price() reverts.
+        // Note: `require_auth` traps at the host level (Auth error), not as a contract enum.
+        // `try_submit_price` captures this host rejection as an outer `Err`.
+        let result = client.try_submit_price(&base, &quote, &10_000_000);
+        assert!(result.is_err(), "Expected transaction to revert due to lack of admin auth");
+
+        // Task 3: Verify no price is stored after the failed call
+        let price_result = client.try_get_price(&base, &quote);
+        assert_eq!(price_result, Err(Ok(OracleError::PriceNotFound)), "Price should not be stored after a failed submission");
     }
 
     #[test]
@@ -461,12 +511,12 @@ mod tests {
 
         // At exact boundary
         env.ledger().with_mut(|l| l.timestamp = submit_time + threshold);
-        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, price);
 
         // One second past boundary
         env.ledger().with_mut(|l| l.timestamp = submit_time + threshold + 1);
-        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, price);
     }
 
