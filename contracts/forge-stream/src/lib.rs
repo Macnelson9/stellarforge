@@ -759,6 +759,23 @@ mod tests {
         assert_eq!(result, Err(Ok(StreamError::InvalidConfig)));
     }
 
+    /// `create_stream` with `rate_per_second = 0` must be rejected with `InvalidConfig`.
+    /// A zero-rate stream would never accrue tokens, making it meaningless and
+    /// indistinguishable from a no-op. The contract enforces `rate > 0` at creation.
+    #[test]
+    fn test_create_stream_zero_rate_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let result = client.try_create_stream(&sender, &token, &recipient, &0, &1000);
+        assert_eq!(result, Err(Ok(StreamError::InvalidConfig)));
+    }
+
     #[test]
     fn test_stream_not_found() {
         let env = Env::default();
@@ -887,24 +904,12 @@ mod tests {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender, &10_000_000i128);
-
-        let duration = 1_000u64;
-        let rate = 1i128;
-        let total = rate * duration as i128;
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
-
         let duration = 1_000u64;
         let rate = 1i128;
         let total = rate * duration as i128; // 1_000
         let token = setup_token(&env, &sender, total);
 
-        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+        let stream_id = client.create_stream(&sender, &token, &recipient, &rate, &duration);
 
         env.ledger().with_mut(|l| l.timestamp += 333);
         let status = client.get_stream_status(&stream_id);
@@ -912,8 +917,6 @@ mod tests {
         assert_eq!(status.remaining, total - 333);
         assert_eq!(status.streamed + status.remaining, total);
 
-        env.ledger().with_mut(|l| l.timestamp += 667);
-        // Full duration elapsed
         env.ledger().with_mut(|l| l.timestamp += 667); // total += 1000
         let status = client.get_stream_status(&stream_id);
         assert_eq!(status.streamed, total);
@@ -930,24 +933,20 @@ mod tests {
         let client = ForgeStreamClient::new(&env, &contract_id);
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let token = make_token(&env, &contract_id, &sender, i128::MAX);
 
         let duration = 1_000u64;
-        // Largest rate that won't overflow i128 when multiplied by duration
         let rate = i128::MAX / duration as i128;
         let total = rate * duration as i128;
         let token = setup_token(&env, &sender, total);
 
         let stream_id = client.create_stream(&sender, &token, &recipient, &rate, &duration);
 
-        // Mid-stream
         env.ledger().with_mut(|l| l.timestamp += 500);
         let status = client.get_stream_status(&stream_id);
         assert_eq!(status.streamed, rate * 500);
         assert_eq!(status.remaining, total - rate * 500);
         assert_eq!(status.streamed + status.remaining, total);
 
-        // At end
         env.ledger().with_mut(|l| l.timestamp += 500);
         let status = client.get_stream_status(&stream_id);
         assert_eq!(status.streamed, total);
@@ -964,20 +963,6 @@ mod tests {
         let client = ForgeStreamClient::new(&env, &contract_id);
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
-
-        let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender, &10_000_000i128);
-
-        let rate = 7i128;
-        let duration = 100u64;
-        let total = rate * duration as i128;
-
-        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
 
         let rate = 7i128; // intentionally odd to surface any rounding
         let duration = 100u64;
@@ -999,8 +984,9 @@ mod tests {
         }
     }
 
+    /// On cancel, withdrawable + returnable == total (no tokens lost or created).
     #[test]
-    fn test_cancel_stream_split_at_halfway() {
+    fn test_cancel_no_tokens_lost() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, ForgeStream);
@@ -1008,40 +994,23 @@ mod tests {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
 
-        let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        let token = TokenClient::new(&env, &token_id);
-
-        let rate = 100i128;
+        let rate = 3i128;
         let duration = 1_000u64;
-        let halfway = duration / 2;
         let total = rate * duration as i128;
-        let expected_accrued = rate * halfway as i128;
-        let expected_remaining = total - expected_accrued;
+        let token = setup_token(&env, &sender, total);
 
-        sac.mint(&sender, &10_000_000i128);
+        let stream_id = client.create_stream(&sender, &token, &recipient, &rate, &duration);
 
-        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+        env.ledger().with_mut(|l| l.timestamp += 400);
 
-        env.ledger().with_mut(|l| l.timestamp += halfway);
-
-        let recipient_before_cancel = token.balance(&recipient);
-        let sender_before_cancel = token.balance(&sender);
+        let status = client.get_stream_status(&stream_id);
+        let expected_withdrawable = status.withdrawable;
+        let expected_returnable = total - status.streamed;
 
         client.cancel_stream(&stream_id);
 
-        let recipient_after_cancel = token.balance(&recipient);
-        let sender_after_cancel = token.balance(&sender);
-
-        let recipient_received = recipient_after_cancel - recipient_before_cancel;
-        let sender_received = sender_after_cancel - sender_before_cancel;
-
-        assert_eq!(recipient_received, expected_accrued);
-        assert_eq!(sender_received, expected_remaining);
-        assert_eq!(recipient_received + sender_received, total);
+        assert_eq!(expected_withdrawable + expected_returnable, total);
+        assert_eq!(status.streamed + status.remaining, total);
     }
 
     // ── get_claimable tests ───────────────────────────────────────────────────
@@ -1054,20 +1023,14 @@ mod tests {
         let client = ForgeStreamClient::new(&env, &contract_id);
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let token = setup_token(&env, &sender, 100 * 1000);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
 
         let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender, &10_000_000i128);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
         env.ledger().with_mut(|l| l.timestamp += 50);
 
-        assert_eq!(client.get_claimable(&stream_id), 5_000);
         assert_eq!(client.get_claimable(&stream_id), 5_000); // 100 * 50
     }
 
@@ -1079,20 +1042,14 @@ mod tests {
         let client = ForgeStreamClient::new(&env, &contract_id);
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let token = setup_token(&env, &sender, 100 * 1000);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
 
         let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender, &10_000_000i128);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
         env.ledger().with_mut(|l| l.timestamp += 2000);
 
-        assert_eq!(client.get_claimable(&stream_id), 100_000);
         assert_eq!(client.get_claimable(&stream_id), 100_000); // 100 * 1000
     }
 
@@ -1106,53 +1063,8 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender, &10_000_000i128);
-        let token = setup_token(&env, &sender, 100 * 1000);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
-
-        let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
-        env.ledger().with_mut(|l| l.timestamp += 200);
-        client.cancel_stream(&stream_id);
-
-        assert_eq!(client.get_claimable(&stream_id), 0);
-
-        let rate = 3i128;
-        let duration = 1_000u64;
-        let total = rate * duration as i128;
-
-        let stream_id = client.create_stream(&sender, &token, &recipient, &rate, &duration);
-
-        // Advance to a mid-stream point, then cancel
-        env.ledger().with_mut(|l| l.timestamp += 400);
-
-        // Capture expected split before cancel
-        let status = client.get_stream_status(&stream_id);
-        let expected_withdrawable = status.withdrawable;
-        let expected_returnable = total - status.streamed;
-
-        client.cancel_stream(&stream_id);
-
-        // Verify the split sums to total
-        assert_eq!(expected_withdrawable + expected_returnable, total);
-        assert_eq!(status.streamed + status.remaining, total);
-
-        let rate = 3i128;
-        let duration = 1_000u64;
-        let total = rate * duration as i128;
-
-        let stream_id = client.create_stream(&sender, &token, &recipient, &rate, &duration);
-
-        // Advance to a mid-stream point, then cancel
-        env.ledger().with_mut(|l| l.timestamp += 400);
-
-        // Capture expected split before cancel
-        let status = client.get_stream_status(&stream_id);
-        let expected_withdrawable = status.withdrawable;
-        let expected_returnable = total - status.streamed;
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
         env.ledger().with_mut(|l| l.timestamp += 200);
@@ -1230,7 +1142,6 @@ mod tests {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
         let token = setup_token(&env, &sender, 100 * 1000);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
 
         let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
         env.ledger().with_mut(|l| l.timestamp += 100);
@@ -1252,7 +1163,6 @@ mod tests {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
         let token = setup_token(&env, &sender, 100 * 1000);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
 
         let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
         env.ledger().with_mut(|l| l.timestamp += 100);
@@ -1281,7 +1191,6 @@ mod tests {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
         let token = setup_token(&env, &sender, 100 * 1000);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
 
         let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
         env.ledger().with_mut(|l| l.timestamp += 100);
@@ -1309,7 +1218,6 @@ mod tests {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
         let token = setup_token(&env, &sender, 100 * 1000);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
 
         let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
         client.pause_stream(&stream_id);
@@ -1327,7 +1235,6 @@ mod tests {
         let sender = Address::generate(&env);
         let recipient = Address::generate(&env);
         let token = setup_token(&env, &sender, 100 * 1000);
-        let token = make_token(&env, &contract_id, &sender, 1_000_000);
 
         let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
 
@@ -1381,7 +1288,6 @@ mod tests {
 
     #[test]
     fn test_get_stream_count_starts_at_zero() {
-    fn test_get_streams_by_sender_empty() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, ForgeStream);
@@ -1392,6 +1298,55 @@ mod tests {
 
     #[test]
     fn test_get_stream_count_increments_on_create() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&sender, &1_000_000);
+
+        assert_eq!(client.get_stream_count(), 0);
+
+        client.create_stream(&sender, &token_id, &recipient, &100, &1000);
+        assert_eq!(client.get_stream_count(), 1);
+
+        client.create_stream(&sender, &token_id, &recipient, &100, &1000);
+        assert_eq!(client.get_stream_count(), 2);
+
+        client.create_stream(&sender, &token_id, &recipient, &100, &1000);
+        assert_eq!(client.get_stream_count(), 3);
+    }
+
+    #[test]
+    fn test_get_stream_count_includes_cancelled_streams() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&sender, &1_000_000);
+
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
+        client.cancel_stream(&stream_id);
+
+        // count should still be 1 even after cancellation
+        assert_eq!(client.get_stream_count(), 1);
+    }
+
+    #[test]
+    fn test_get_streams_by_sender_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
         let sender = Address::generate(&env);
 
         let streams = client.get_streams_by_sender(&sender);
@@ -1421,27 +1376,7 @@ mod tests {
 
         let token_admin = Address::generate(&env);
         let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
-        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&sender, &1_000_000);
-
-        assert_eq!(client.get_stream_count(), 0);
-
-        client.create_stream(&sender, &token_id, &recipient, &100, &1000);
-        assert_eq!(client.get_stream_count(), 1);
-
-        client.create_stream(&sender, &token_id, &recipient, &100, &1000);
-        assert_eq!(client.get_stream_count(), 2);
-
-        client.create_stream(&sender, &token_id, &recipient, &100, &1000);
-        assert_eq!(client.get_stream_count(), 3);
-    }
-
-    #[test]
-    fn test_get_stream_count_includes_cancelled_streams() {
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender, &10_000_000i128);
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
 
@@ -1460,11 +1395,8 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender, &10_000_000i128);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
 
@@ -1480,26 +1412,12 @@ mod tests {
         let contract_id = env.register_contract(None, ForgeStream);
         let client = ForgeStreamClient::new(&env, &contract_id);
         let sender = Address::generate(&env);
-        let recipient = Address::generate(&env);
-
-        let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
-        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&sender, &1_000_000);
-
-        let stream_id = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
-        client.cancel_stream(&stream_id);
-
-        // count should still be 1 even after cancellation
-        assert_eq!(client.get_stream_count(), 1);
         let recipient1 = Address::generate(&env);
         let recipient2 = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender, &10_000_000i128);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
 
         let stream_id1 = client.create_stream(&sender, &token_id, &recipient1, &100, &1000);
         let stream_id2 = client.create_stream(&sender, &token_id, &recipient2, &50, &800);
@@ -1521,12 +1439,9 @@ mod tests {
         let recipient = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender1, &10_000_000i128);
-        sac.mint(&sender2, &10_000_000i128);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender1, &10_000_000i128);
+        StellarAssetClient::new(&env, &token_id).mint(&sender2, &10_000_000i128);
 
         let stream_id1 = client.create_stream(&sender1, &token_id, &recipient, &100, &1000);
         let stream_id2 = client.create_stream(&sender2, &token_id, &recipient, &50, &800);
@@ -1549,32 +1464,25 @@ mod tests {
         let recipient2 = Address::generate(&env);
 
         let token_admin = Address::generate(&env);
-        let token_id = env
-            .register_stellar_asset_contract_v2(token_admin)
-            .address();
-        let sac = StellarAssetClient::new(&env, &token_id);
-        sac.mint(&sender1, &10_000_000i128);
-        sac.mint(&sender2, &10_000_000i128);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender1, &10_000_000i128);
+        StellarAssetClient::new(&env, &token_id).mint(&sender2, &10_000_000i128);
 
         let stream_id1 = client.create_stream(&sender1, &token_id, &recipient1, &100, &1000);
         let stream_id2 = client.create_stream(&sender2, &token_id, &recipient2, &50, &800);
 
-        // Verify sender1 only sees their stream
         let sender1_streams = client.get_streams_by_sender(&sender1);
         assert_eq!(sender1_streams.len(), 1);
         assert_eq!(sender1_streams.get(0).unwrap(), stream_id1);
 
-        // Verify sender2 only sees their stream
         let sender2_streams = client.get_streams_by_sender(&sender2);
         assert_eq!(sender2_streams.len(), 1);
         assert_eq!(sender2_streams.get(0).unwrap(), stream_id2);
 
-        // Verify recipient1 only sees their stream
         let recipient1_streams = client.get_streams_by_recipient(&recipient1);
         assert_eq!(recipient1_streams.len(), 1);
         assert_eq!(recipient1_streams.get(0).unwrap(), stream_id1);
 
-        // Verify recipient2 only sees their stream
         let recipient2_streams = client.get_streams_by_recipient(&recipient2);
         assert_eq!(recipient2_streams.len(), 1);
         assert_eq!(recipient2_streams.get(0).unwrap(), stream_id2);

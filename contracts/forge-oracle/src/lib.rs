@@ -11,7 +11,6 @@
 //! - Event emission on every price update
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -454,14 +453,9 @@ mod tests {
         let found = events.iter().any(|(_, topics, data)| {
             topics
                 .get(0)
-            topics
-                .get(0)
                 .and_then(|t| Symbol::try_from_val(&env, &t).ok())
                 .map(|s| s == Symbol::new(&env, "price_updated"))
                 .unwrap_or(false)
-                && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
-                    .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 5000)
-                    .unwrap_or(false)
                 && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
                     .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 5000)
                     .unwrap_or(false)
@@ -487,14 +481,9 @@ mod tests {
         let found = events.iter().any(|(_, topics, data)| {
             topics
                 .get(0)
-            topics
-                .get(0)
                 .and_then(|t| Symbol::try_from_val(&env, &t).ok())
                 .map(|s| s == Symbol::new(&env, "price_updated"))
                 .unwrap_or(false)
-                && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
-                    .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 10000)
-                    .unwrap_or(false)
                 && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
                     .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 10000)
                     .unwrap_or(false)
@@ -573,15 +562,11 @@ mod tests {
 
         // At exact boundary
         env.ledger().with_mut(|l| l.timestamp = submit_time + threshold);
-        env.ledger()
-            .with_mut(|l| l.timestamp = submit_time + threshold);
         let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, price);
 
         // One second past boundary
         env.ledger().with_mut(|l| l.timestamp = submit_time + threshold + 1);
-        env.ledger()
-            .with_mut(|l| l.timestamp = submit_time + threshold + 1);
         let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, price);
     }
@@ -611,23 +596,12 @@ mod tests {
             &Symbol::new(&env, "USDC"),
             &70_000_000_000,
         );
-        client.submit_price(
-            &Symbol::new(&env, "BTC"),
-            &Symbol::new(&env, "USDC"),
-            &70_000_000_000,
-        );
 
         let count = env
             .events()
             .all()
             .iter()
-        let count = env
-            .events()
-            .all()
-            .iter()
             .filter(|(_, topics, _)| {
-                topics
-                    .get(0)
                 topics
                     .get(0)
                     .and_then(|t| Symbol::try_from_val(&env, &t).ok())
@@ -680,5 +654,4 @@ mod tests {
         assert_eq!(data_unsafe.price, new_price);
         assert_eq!(data_unsafe.updated_at, 2000);
     }
-}
 }

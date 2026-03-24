@@ -11,7 +11,6 @@
 //! - Anyone can propose; execution is permissionless once passed
 
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, String, Vec};
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -538,7 +537,6 @@ mod tests {
     };
 
     fn setup(env: &Env) -> GovernorContractClient<'_> {
-    fn setup<'a>(env: &'a Env) -> GovernorContractClient<'a> {
         let contract_id = env.register_contract(None, GovernorContract);
         let client = GovernorContractClient::new(env, &contract_id);
         let token = Address::generate(env);
@@ -790,6 +788,61 @@ mod tests {
 
     #[test]
     fn test_has_voted_returns_true_for_voter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+
+        // Voter has not voted yet
+        assert!(!client.has_voted(&pid, &voter));
+
+        // Cast vote
+        client.vote(&voter, &pid, &true, &100);
+
+        // Now voter has voted
+        assert!(client.has_voted(&pid, &voter));
+    }
+
+    #[test]
+    fn test_has_voted_returns_false_for_non_voter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let non_voter = Address::generate(&env);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+
+        // non_voter has not participated at all
+        assert!(!client.has_voted(&pid, &non_voter));
+
+        // voter votes
+        client.vote(&voter, &pid, &true, &100);
+
+        // non_voter still has not voted
+        assert!(!client.has_voted(&pid, &non_voter));
+
+        // voter has voted
+        assert!(client.has_voted(&pid, &voter));
+    }
+
+    #[test]
     fn test_get_pending_proposals_empty_when_none_exist() {
         let env = Env::default();
         env.mock_all_auths();
@@ -811,7 +864,6 @@ mod tests {
         let pid0 = client.propose(&proposer, &String::from_str(&env, "P0"), &String::from_str(&env, "D"));
         let pid1 = client.propose(&proposer, &String::from_str(&env, "P1"), &String::from_str(&env, "D"));
 
-        // Both proposals are active within the voting period
         let pending = client.get_pending_proposals();
         assert_eq!(pending.len(), 2);
         assert_eq!(pending.get(0).unwrap(), pid0);
@@ -828,28 +880,9 @@ mod tests {
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
 
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
-
-        // Voter has not voted yet
-        assert_eq!(client.has_voted(&pid, &voter), false);
-
-        // Cast vote
-        client.vote(&voter, &pid, &true, &100);
-
-        // Now voter has voted
-        assert_eq!(client.has_voted(&pid, &voter), true);
-    }
-
-    #[test]
-    fn test_has_voted_returns_false_for_non_voter() {
         // pid0: will be finalized (passed)
         let pid0 = client.propose(&proposer, &String::from_str(&env, "P0"), &String::from_str(&env, "D"));
         client.vote(&voter, &pid0, &true, &200);
-        let pid = client.propose(
-            &proposer,
-            &String::from_str(&env, "P"),
-            &String::from_str(&env, "D"),
-        );
 
         // pid1: will remain active but its voting window also expires at t=5000
         let _pid1 = client.propose(&proposer, &String::from_str(&env, "P1"), &String::from_str(&env, "D"));
@@ -858,8 +891,7 @@ mod tests {
         env.ledger().with_mut(|l| l.timestamp = 5000);
         client.finalize(&pid0);
 
-        // pid1 was created at t=0, vote_end = 3600, current time is 5000 → also expired but not finalized
-        // Only proposals with state==Active AND now<=vote_end are returned
+        // Both proposals' voting windows have expired — none should be pending
         let pending = client.get_pending_proposals();
         assert_eq!(pending.len(), 0);
     }
@@ -872,25 +904,6 @@ mod tests {
         let client = setup(&env);
 
         let proposer = Address::generate(&env);
-        let voter = Address::generate(&env);
-        let non_voter = Address::generate(&env);
-
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
-
-        // non_voter has not participated at all
-        assert_eq!(client.has_voted(&pid, &non_voter), false);
-
-        // voter votes
-        client.vote(&voter, &pid, &true, &100);
-
-        // non_voter still has not voted
-        assert_eq!(client.has_voted(&pid, &non_voter), false);
-
-        // voter has voted
-        assert_eq!(client.has_voted(&pid, &voter), true);
-    }
-}
-        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
         let pid = client.propose(
             &proposer,
             &String::from_str(&env, "P"),
@@ -922,12 +935,6 @@ mod tests {
         let pid0 = client.propose(&proposer, &String::from_str(&env, "P0"), &String::from_str(&env, "D"));
         client.vote(&voter, &pid0, &true, &200);
 
-        let pid = client.propose(
-            &proposer,
-            &String::from_str(&env, "P"),
-            &String::from_str(&env, "D"),
-        );
-        client.vote(&voter, &pid, &true, &200);
         env.ledger().with_mut(|l| l.timestamp = 5000);
         client.finalize(&pid0);
 

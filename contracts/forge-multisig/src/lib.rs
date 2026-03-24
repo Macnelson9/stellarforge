@@ -684,8 +684,6 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let (client, _, _, _) = setup_2of3(&env);
-        let contract_id = env.register_contract(None, MultisigContract);
-        let client = MultisigContractClient::new(&env, &contract_id);
 
         assert_eq!(client.get_approval_count(&999), 0);
     }
