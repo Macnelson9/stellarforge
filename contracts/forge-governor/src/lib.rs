@@ -391,25 +391,27 @@ impl GovernorContract {
 
     /// Return a proposal by its ID.
     ///
-    /// Read-only; does not modify state. Returns `None` if no proposal exists
-    /// with the given ID.
+    /// Read-only; does not modify state.
     ///
     /// # Parameters
     /// - `proposal_id` — The ID returned by [`propose`](Self::propose).
     ///
     /// # Returns
-    /// `Some(`[`Proposal`]`)` if found, `None` otherwise.
+    /// `Ok(`[`Proposal`]`)` with the full proposal details.
+    ///
+    /// # Errors
+    /// - [`GovernorError::ProposalNotFound`] — No proposal exists with `proposal_id`.
     ///
     /// # Example
     /// ```text
-    /// if let Some(p) = client.get_proposal(&id) {
-    ///     println!("votes_for: {}", p.votes_for);
-    /// }
+    /// let proposal = client.get_proposal(&id)?;
+    /// println!("votes_for: {}", proposal.votes_for);
     /// ```
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, GovernorError> {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
+            .ok_or(GovernorError::ProposalNotFound)
     }
 
     /// Return the governor configuration set at initialization.
@@ -528,6 +530,111 @@ mod tests {
         client.vote(&voter, &pid, &true, &100);
         let result = client.try_vote(&voter, &pid, &true, &100);
         assert_eq!(result, Err(Ok(GovernorError::AlreadyVoted)));
+    }
+
+    #[test]
+    fn test_get_proposal_existing() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let title = String::from_str(&env, "My Proposal");
+        let description = String::from_str(&env, "Details here");
+        let pid = client.propose(&proposer, &title, &description);
+
+        let proposal = client.get_proposal(&pid);
+        assert_eq!(proposal.proposer, proposer);
+        assert_eq!(proposal.title, title);
+        assert_eq!(proposal.description, description);
+        assert_eq!(proposal.state, ProposalState::Active);
+        assert_eq!(proposal.vote_start, 1000);
+        assert_eq!(proposal.votes_for, 0);
+        assert_eq!(proposal.votes_against, 0);
+    }
+
+    #[test]
+    fn test_get_proposal_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = setup(&env);
+
+        let result = client.try_get_proposal(&999);
+        assert!(matches!(result, Err(Ok(GovernorError::ProposalNotFound))));
+    }
+
+    #[test]
+    fn test_finalize_fails_when_quorum_not_reached() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+
+        // Vote with weight below quorum (quorum = 100)
+        let voter = Address::generate(&env);
+        client.vote(&voter, &pid, &true, &50);
+
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        let state = client.finalize(&pid);
+        assert_eq!(state, ProposalState::Failed);
+    }
+
+    #[test]
+    fn test_finalize_passes_when_quorum_met_and_majority_yes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+
+        let voter = Address::generate(&env);
+        client.vote(&voter, &pid, &true, &100);
+
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        let state = client.finalize(&pid);
+        assert_eq!(state, ProposalState::Passed);
+    }
+
+    #[test]
+    fn test_execute_failed_proposal_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        client.finalize(&pid); // fails: no votes
+
+        let executor = Address::generate(&env);
+        let result = client.try_execute(&executor, &pid);
+        assert!(matches!(result, Err(Ok(GovernorError::ProposalNotPassed))));
+    }
+
+    #[test]
+    fn test_vote_after_voting_period_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let pid = client.propose(&proposer, &String::from_str(&env, "P"), &String::from_str(&env, "D"));
+
+        // Advance past voting_period (3600)
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+
+        let voter = Address::generate(&env);
+        let result = client.try_vote(&voter, &pid, &true, &100);
+        assert!(matches!(result, Err(Ok(GovernorError::VotingClosed))));
     }
 
     #[test]
