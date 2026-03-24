@@ -10,7 +10,7 @@
 //! - Owners can propose, approve, reject, and execute transactions
 //! - Native token support via Stellar token interface
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Vec};
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -123,7 +123,9 @@ impl MultisigContract {
         if threshold == 0 || threshold > unique_owners.len() {
             return Err(MultisigError::InvalidThreshold);
         }
-        env.storage().instance().set(&DataKey::Owners, &unique_owners);
+        env.storage()
+            .instance()
+            .set(&DataKey::Owners, &unique_owners);
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
@@ -423,6 +425,14 @@ impl MultisigContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Return the list of authorized owner addresses. Alias for [`get_owners`](Self::get_owners).
+    ///
+    /// # Returns
+    /// A [`Vec<Address>`] of all current owners.
+    pub fn get_owner_list(env: Env) -> Vec<Address> {
+        Self::get_owners(env)
+    }
+
     /// Return the current approval threshold (N in N-of-M).
     ///
     /// Read-only; returns `0` if the contract has not been initialized.
@@ -511,11 +521,12 @@ mod tests {
     fn test_initialize_with_duplicate_owners() {
         let env = Env::default();
         env.mock_all_auths();
-        env.register(MultisigContract, ());
+        let mid = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &mid);
         let o1 = Address::generate(&env);
         let owners = vec![&env, o1.clone(), o1.clone(), o1.clone()]; // 3 duplicates
-        MultisigContract::initialize(env.clone(), owners, 1, 0).unwrap();
-        let stored_owners = MultisigContract::get_owners(env);
+        client.initialize(&owners, &1, &0);
+        let stored_owners = client.get_owners();
         assert_eq!(stored_owners.len(), 1);
         assert!(stored_owners.contains(&o1));
     }
@@ -578,7 +589,9 @@ mod tests {
         client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &2, &3600);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let to = Address::generate(&env);
         soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
 
@@ -622,7 +635,9 @@ mod tests {
         client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &2, &3600);
 
         let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
         let to = Address::generate(&env);
         soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
 
@@ -688,5 +703,16 @@ mod tests {
         env.ledger().with_mut(|l| l.timestamp = 7200);
         let result = client.try_execute(&o3, &pid);
         assert_eq!(result, Err(Ok(MultisigError::InsufficientApprovals)));
+    }
+
+    #[test]
+    fn test_get_owners_list() {
+        let env = Env::default();
+        let (client, o1, o2, o3) = setup_2of3(&env);
+        let owners = client.get_owner_list();
+        assert_eq!(owners.len(), 3);
+        assert!(owners.contains(&o1));
+        assert!(owners.contains(&o2));
+        assert!(owners.contains(&o3));
     }
 }

@@ -10,7 +10,7 @@
 //! - Configurable staleness threshold — reads revert if price is too old
 //! - Event emission on every price update
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, Symbol};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -401,13 +401,14 @@ mod tests {
         // events() returns Vec<(contract_addr, topics: Vec<Val>, data: Val)>
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, data)| {
-            topics.get(0)
+            topics
+                .get(0)
                 .and_then(|t| Symbol::try_from_val(&env, &t).ok())
                 .map(|s| s == Symbol::new(&env, "price_updated"))
                 .unwrap_or(false)
-            && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
-                .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 5000)
-                .unwrap_or(false)
+                && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
+                    .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 5000)
+                    .unwrap_or(false)
         });
         assert!(found, "Expected price_updated event not found");
     }
@@ -428,13 +429,14 @@ mod tests {
 
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, data)| {
-            topics.get(0)
+            topics
+                .get(0)
                 .and_then(|t| Symbol::try_from_val(&env, &t).ok())
                 .map(|s| s == Symbol::new(&env, "price_updated"))
                 .unwrap_or(false)
-            && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
-                .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 10000)
-                .unwrap_or(false)
+                && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
+                    .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 10000)
+                    .unwrap_or(false)
         });
         assert!(found, "Event data does not match expected values");
     }
@@ -457,9 +459,13 @@ mod tests {
         client.submit_price(&base, &quote, &10_000_000);
 
         // Advance to exactly updated_at + threshold
-        env.ledger().with_mut(|l| l.timestamp = submit_time + threshold);
+        env.ledger()
+            .with_mut(|l| l.timestamp = submit_time + threshold);
         let result = client.try_get_price(&base, &quote);
-        assert!(result.is_ok(), "expected Ok at exact boundary, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "expected Ok at exact boundary, got {result:?}"
+        );
     }
 
     /// get_price() reverts when now == updated_at + threshold + 1 (one second past).
@@ -478,7 +484,8 @@ mod tests {
         client.submit_price(&base, &quote, &10_000_000);
 
         // One second past the threshold
-        env.ledger().with_mut(|l| l.timestamp = submit_time + threshold + 1);
+        env.ledger()
+            .with_mut(|l| l.timestamp = submit_time + threshold + 1);
         let result = client.try_get_price(&base, &quote);
         assert_eq!(result, Err(Ok(OracleError::PriceStale)));
     }
@@ -500,13 +507,15 @@ mod tests {
         client.submit_price(&base, &quote, &price);
 
         // At exact boundary
-        env.ledger().with_mut(|l| l.timestamp = submit_time + threshold);
-        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        env.ledger()
+            .with_mut(|l| l.timestamp = submit_time + threshold);
+        let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, price);
 
         // One second past boundary
-        env.ledger().with_mut(|l| l.timestamp = submit_time + threshold + 1);
-        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        env.ledger()
+            .with_mut(|l| l.timestamp = submit_time + threshold + 1);
+        let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, price);
     }
 
@@ -518,19 +527,34 @@ mod tests {
         let (_, client) = setup(&env);
 
         env.ledger().with_mut(|l| l.timestamp = 1000);
-        client.submit_price(&Symbol::new(&env, "XLM"), &Symbol::new(&env, "USDC"), &1_000_000);
+        client.submit_price(
+            &Symbol::new(&env, "XLM"),
+            &Symbol::new(&env, "USDC"),
+            &1_000_000,
+        );
 
         env.ledger().with_mut(|l| l.timestamp = 2000);
-        client.submit_price(&Symbol::new(&env, "BTC"), &Symbol::new(&env, "USDC"), &70_000_000_000);
+        client.submit_price(
+            &Symbol::new(&env, "BTC"),
+            &Symbol::new(&env, "USDC"),
+            &70_000_000_000,
+        );
 
-        let count = env.events().all().iter()
+        let count = env
+            .events()
+            .all()
+            .iter()
             .filter(|(_, topics, _)| {
-                topics.get(0)
+                topics
+                    .get(0)
                     .and_then(|t| Symbol::try_from_val(&env, &t).ok())
                     .map(|s| s == Symbol::new(&env, "price_updated"))
                     .unwrap_or(false)
             })
             .count();
-        assert!(count >= 2, "Expected at least 2 price_updated events, found {}", count);
+        assert!(
+            count >= 2,
+            "Expected at least 2 price_updated events, found {count}"
+        );
     }
 }
