@@ -559,6 +559,8 @@ mod tests {
         // remaining 600_000 → admin
         assert_eq!(tc.balance(&beneficiary), 400_000);
         assert_eq!(tc.balance(&admin), 600_000);
+    }
+
     #[test]
     fn test_transfer_admin_success() {
         let (env, contract_id, token, beneficiary, admin) = setup();
@@ -604,36 +606,4 @@ mod tests {
         (env, contract_id, token_id, beneficiary, admin)
     }
 
-    #[test]
-    fn test_cancel_before_cliff_beneficiary_gets_zero_admin_gets_all() {
-        let (env, contract_id, token_id, beneficiary, admin) = setup_with_token();
-        let client = ForgeVestingClient::new(&env, &contract_id);
-        client.initialize(&token_id, &beneficiary, &admin, &1_000_000, &500, &1000);
-
-        // advance 100s — still before cliff of 500s
-        env.ledger().with_mut(|l| l.timestamp += 100);
-        client.cancel();
-
-        let tc = soroban_sdk::token::Client::new(&env, &token_id);
-        assert_eq!(tc.balance(&beneficiary), 0);
-        assert_eq!(tc.balance(&admin), 1_000_000);
-    }
-
-    #[test]
-    fn test_cancel_after_cliff_splits_tokens_correctly() {
-        let (env, contract_id, token_id, beneficiary, admin) = setup_with_token();
-        let client = ForgeVestingClient::new(&env, &contract_id);
-        client.initialize(&token_id, &beneficiary, &admin, &1_000_000, &100, &1000);
-
-        // advance 400s — past cliff, 40% vested
-        env.ledger().with_mut(|l| l.timestamp += 400);
-        client.claim();
-        client.cancel();
-
-        let tc = soroban_sdk::token::Client::new(&env, &token_id);
-        // 400/1000 * 1_000_000 = 400_000 vested → beneficiary
-        // remaining 600_000 → admin
-        assert_eq!(tc.balance(&beneficiary), 400_000);
-        assert_eq!(tc.balance(&admin), 600_000);
-    }
 }
