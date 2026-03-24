@@ -168,6 +168,14 @@ cargo test -p forge-oracle
 
 ---
 
+## 🔗 Composability Guide
+
+A step-by-step walkthrough showing how to combine multiple StellarForge contracts is available in [`docs/composability.md`](docs/composability.md).
+
+The guide covers a full DAO scenario using `forge-governor`, `forge-multisig`, and `forge-stream` together, plus common composability patterns for other contract combinations.
+
+---
+
 ## 📐 State Diagrams
 
 Visual lifecycle documentation for stateful contracts is available in [`docs/state-diagrams.md`](docs/state-diagrams.md).
