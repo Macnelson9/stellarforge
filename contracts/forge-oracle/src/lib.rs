@@ -238,11 +238,11 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
-        Env, Symbol,
+        Env, Symbol, TryFromVal,
     };
 
     fn setup(env: &Env) -> (Address, ForgeOracleClient) {
-        let contract_id = env.register(ForgeOracle, ());
+        let contract_id = env.register_contract(None, ForgeOracle);
         let client = ForgeOracleClient::new(env, &contract_id);
         let admin = Address::generate(env);
         client.initialize(&admin, &3600);
@@ -260,7 +260,7 @@ mod tests {
         let quote = Symbol::new(&env, "USDC");
 
         client.submit_price(&base, &quote, &11_000_000); // 1.11 USDC per XLM
-        let data = client.get_price(&base, &quote).unwrap();
+        let data = client.get_price(&base, &quote);
 
         assert_eq!(data.price, 11_000_000);
         assert_eq!(data.updated_at, 1000);
@@ -297,7 +297,7 @@ mod tests {
         client.submit_price(&base, &quote, &50_000_000);
         env.ledger().with_mut(|l| l.timestamp = 99999);
 
-        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        let data = client.get_price_unsafe(&base, &quote);
         assert_eq!(data.price, 50_000_000);
     }
 
@@ -346,6 +346,7 @@ mod tests {
 
     #[test]
     fn test_submit_price_emits_event() {
+        use soroban_sdk::testutils::Events;
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 5000);
@@ -353,33 +354,27 @@ mod tests {
 
         let base = Symbol::new(&env, "XLM");
         let quote = Symbol::new(&env, "USDC");
-        let price = 15_000_000; // 1.5 USDC per XLM
+        let price = 15_000_000i128;
 
-        // Submit price which should emit event
         client.submit_price(&base, &quote, &price);
 
-        // Verify event was emitted
+        // events() returns Vec<(contract_addr, topics: Vec<Val>, data: Val)>
         let events = env.events().all();
-        let expected_event_topic = (Symbol::new(&env, "price_updated"),);
-        let expected_event_data = (base.clone(), quote.clone(), price, 5000u64);
-
-        // Check that at least one event matches our expectations
-        let found = events.iter().any(|(topic, data)| {
-            if let Ok(t) = topic.clone().try_into::<(Symbol,)>() {
-                if t == expected_event_topic {
-                    if let Ok(d) = data.clone().try_into::<(Symbol, Symbol, i128, u64)>() {
-                        return d == expected_event_data;
-                    }
-                }
-            }
-            false
+        let found = events.iter().any(|(_, topics, data)| {
+            topics.get(0)
+                .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                .map(|s| s == Symbol::new(&env, "price_updated"))
+                .unwrap_or(false)
+            && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
+                .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 5000)
+                .unwrap_or(false)
         });
-
         assert!(found, "Expected price_updated event not found");
     }
 
     #[test]
     fn test_submit_price_event_contains_correct_data() {
+        use soroban_sdk::testutils::Events;
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 10000);
@@ -387,87 +382,115 @@ mod tests {
 
         let base = Symbol::new(&env, "BTC");
         let quote = Symbol::new(&env, "EUR");
-        let price = 50_000_000_000; // 50000 EUR per BTC
+        let price = 50_000_000_000i128;
 
         client.submit_price(&base, &quote, &price);
 
         let events = env.events().all();
-
-        // Verify event topic contains "price_updated"
-        let price_updated_events: Vec<_> = events
-            .iter()
-            .filter_map(|(topic, data)| {
-                if let Ok((event_name,)) = topic.clone().try_into::<(Symbol,)>() {
-                    if event_name == Symbol::new(&env, "price_updated") {
-                        return Some((event_name, data.clone()));
-                    }
-                }
-                None
-            })
-            .collect();
-
-        assert!(!price_updated_events.is_empty(), "No price_updated events found");
-
-        // Verify the event data contains the correct values
-        let found_correct_data = price_updated_events.iter().any(|(_, data)| {
-            if let Ok((evt_base, evt_quote, evt_price, evt_timestamp)) =
-                data.clone().try_into::<(Symbol, Symbol, i128, u64)>()
-            {
-                return evt_base == base
-                    && evt_quote == quote
-                    && evt_price == price
-                    && evt_timestamp == 10000;
-            }
-            false
+        let found = events.iter().any(|(_, topics, data)| {
+            topics.get(0)
+                .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                .map(|s| s == Symbol::new(&env, "price_updated"))
+                .unwrap_or(false)
+            && <(Symbol, Symbol, i128, u64)>::try_from_val(&env, &data)
+                .map(|(b, q, p, ts)| b == base && q == quote && p == price && ts == 10000)
+                .unwrap_or(false)
         });
+        assert!(found, "Event data does not match expected values");
+    }
 
-        assert!(
-            found_correct_data,
-            "Event data does not match: expected base={}, quote={}, price={}, timestamp=10000",
-            base,
-            quote,
-            price
-        );
+    // ── Staleness boundary tests ───────────────────────────────────────────────
+
+    /// get_price() succeeds when now == updated_at + threshold (exactly at boundary).
+    #[test]
+    fn test_get_price_at_exact_staleness_boundary_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let threshold = 3600u64;
+        let submit_time = 1000u64;
+
+        env.ledger().with_mut(|l| l.timestamp = submit_time);
+        let (_, client) = setup(&env); // staleness = 3600
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+        client.submit_price(&base, &quote, &10_000_000);
+
+        // Advance to exactly updated_at + threshold
+        env.ledger().with_mut(|l| l.timestamp = submit_time + threshold);
+        let result = client.try_get_price(&base, &quote);
+        assert!(result.is_ok(), "expected Ok at exact boundary, got {:?}", result);
+    }
+
+    /// get_price() reverts when now == updated_at + threshold + 1 (one second past).
+    #[test]
+    fn test_get_price_one_second_past_staleness_boundary_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let threshold = 3600u64;
+        let submit_time = 1000u64;
+
+        env.ledger().with_mut(|l| l.timestamp = submit_time);
+        let (_, client) = setup(&env);
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+        client.submit_price(&base, &quote, &10_000_000);
+
+        // One second past the threshold
+        env.ledger().with_mut(|l| l.timestamp = submit_time + threshold + 1);
+        let result = client.try_get_price(&base, &quote);
+        assert_eq!(result, Err(Ok(OracleError::PriceStale)));
+    }
+
+    /// get_price_unsafe() succeeds at the boundary and one second past it.
+    #[test]
+    fn test_get_price_unsafe_succeeds_regardless_of_staleness() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let threshold = 3600u64;
+        let submit_time = 1000u64;
+
+        env.ledger().with_mut(|l| l.timestamp = submit_time);
+        let (_, client) = setup(&env);
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+        let price = 10_000_000i128;
+        client.submit_price(&base, &quote, &price);
+
+        // At exact boundary
+        env.ledger().with_mut(|l| l.timestamp = submit_time + threshold);
+        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        assert_eq!(data.price, price);
+
+        // One second past boundary
+        env.ledger().with_mut(|l| l.timestamp = submit_time + threshold + 1);
+        let data = client.get_price_unsafe(&base, &quote).unwrap();
+        assert_eq!(data.price, price);
     }
 
     #[test]
     fn test_multiple_price_submissions_emit_events() {
+        use soroban_sdk::testutils::Events;
         let env = Env::default();
         env.mock_all_auths();
         let (_, client) = setup(&env);
 
-        let base1 = Symbol::new(&env, "XLM");
-        let quote1 = Symbol::new(&env, "USDC");
-        let price1 = 1_000_000;
-
-        let base2 = Symbol::new(&env, "BTC");
-        let quote2 = Symbol::new(&env, "USDC");
-        let price2 = 70_000_000_000;
-
         env.ledger().with_mut(|l| l.timestamp = 1000);
-        client.submit_price(&base1, &quote1, &price1);
+        client.submit_price(&Symbol::new(&env, "XLM"), &Symbol::new(&env, "USDC"), &1_000_000);
 
         env.ledger().with_mut(|l| l.timestamp = 2000);
-        client.submit_price(&base2, &quote2, &price2);
+        client.submit_price(&Symbol::new(&env, "BTC"), &Symbol::new(&env, "USDC"), &70_000_000_000);
 
-        let events = env.events().all();
-
-        // Count price_updated events
-        let price_events_count = events
-            .iter()
-            .filter(|(topic, _)| {
-                if let Ok((event_name,)) = topic.clone().try_into::<(Symbol,)>() {
-                    event_name == Symbol::new(&env, "price_updated")
-                } else {
-                    false
-                }
+        let count = env.events().all().iter()
+            .filter(|(_, topics, _)| {
+                topics.get(0)
+                    .and_then(|t| Symbol::try_from_val(&env, &t).ok())
+                    .map(|s| s == Symbol::new(&env, "price_updated"))
+                    .unwrap_or(false)
             })
             .count();
-
-        assert!(
-            price_events_count >= 2,
-            "Expected at least 2 price_updated events, found {}",
-            price_events_count
-        );
+        assert!(count >= 2, "Expected at least 2 price_updated events, found {}", count);
     }
 }
