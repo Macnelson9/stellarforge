@@ -1044,4 +1044,107 @@ mod tests {
         assert_eq!(pending.get(0).unwrap(), pid1);
         assert_eq!(pending.get(1).unwrap(), pid2);
     }
+
+    // ── Tie-breaking behaviour ─────────────────────────────────────────────────
+    //
+    // The contract requires votes_for > votes_against (strict majority) to pass.
+    // When yes votes equal no votes the proposal resolves to Failed — there is
+    // no mechanism that breaks a tie in favour of the proposer or any other party.
+    // This is deterministic and must be explicitly tested.
+
+    /// Equal yes and no votes that together meet quorum must resolve to Failed.
+    /// Tie-breaking rule: votes_for must be strictly greater than votes_against.
+    #[test]
+    fn test_tied_vote_resolves_to_failed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env); // quorum = 100, voting_period = 3600
+
+        let proposer = Address::generate(&env);
+        let yes_voter = Address::generate(&env);
+        let no_voter = Address::generate(&env);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "Tied Proposal"),
+            &String::from_str(&env, "Equal yes and no votes"),
+        );
+
+        // Cast equal weight on both sides — total = 200, meets quorum of 100
+        client.vote(&yes_voter, &pid, &true, &100);
+        client.vote(&no_voter, &pid, &false, &100);
+
+        // Advance past the voting period
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        let state = client.finalize(&pid);
+
+        // Tie must resolve to Failed — strict majority (votes_for > votes_against) required
+        assert_eq!(
+            state,
+            ProposalState::Failed,
+            "a tied vote must resolve to Failed, not Passed"
+        );
+
+        // Confirm the stored state matches
+        let proposal = client.get_proposal(&pid);
+        assert_eq!(proposal.state, ProposalState::Failed);
+        assert_eq!(proposal.votes_for, 100);
+        assert_eq!(proposal.votes_against, 100);
+        assert!(proposal.passed_at.is_none(), "passed_at must not be set on a failed proposal");
+    }
+
+    /// One extra no vote tips a near-tie to Failed.
+    #[test]
+    fn test_near_tie_no_majority_resolves_to_failed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let yes_voter = Address::generate(&env);
+        let no_voter = Address::generate(&env);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "Near-tie Proposal"),
+            &String::from_str(&env, "No votes exceed yes by 1"),
+        );
+
+        // 100 yes, 101 no — quorum met, but no majority
+        client.vote(&yes_voter, &pid, &true, &100);
+        client.vote(&no_voter, &pid, &false, &101);
+
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        let state = client.finalize(&pid);
+        assert_eq!(state, ProposalState::Failed);
+    }
+
+    /// One extra yes vote tips a near-tie to Passed.
+    #[test]
+    fn test_near_tie_yes_majority_resolves_to_passed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let yes_voter = Address::generate(&env);
+        let no_voter = Address::generate(&env);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "Near-tie Proposal"),
+            &String::from_str(&env, "Yes votes exceed no by 1"),
+        );
+
+        // 101 yes, 100 no — quorum met, strict majority achieved
+        client.vote(&yes_voter, &pid, &true, &101);
+        client.vote(&no_voter, &pid, &false, &100);
+
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        let state = client.finalize(&pid);
+        assert_eq!(state, ProposalState::Passed);
+    }
 }
