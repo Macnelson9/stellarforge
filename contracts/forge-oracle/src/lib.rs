@@ -172,7 +172,7 @@ impl ForgeOracle {
             .unwrap_or(3600);
 
         let now = env.ledger().timestamp();
-        if now > updated_at + threshold {
+        if now >= updated_at + threshold {
             return Err(OracleError::PriceStale);
         }
 
@@ -215,7 +215,10 @@ impl ForgeOracle {
     /// Updates the staleness threshold for price validity.
     ///
     /// - `env`: The Soroban environment.
-    /// - `new_threshold`: The new maximum seconds before a price is considered stale.
+    /// - `new_threshold`: The new maximum age of a price in seconds. A price is
+    ///   considered stale when `now >= updated_at + threshold`, i.e. the threshold
+    ///   is exclusive: a price is valid while `now < updated_at + threshold` and
+    ///   stale at exactly `now == updated_at + threshold`.
     ///
     /// Returns `Ok(())` on success, or an `OracleError` if not initialized or unauthorized.
     ///
@@ -560,9 +563,9 @@ mod tests {
 
     // ── Staleness boundary tests ───────────────────────────────────────────────
 
-    /// get_price() succeeds when now == updated_at + threshold (exactly at boundary).
+    /// get_price() reverts when now == updated_at + threshold (exactly at boundary).
     #[test]
-    fn test_get_price_at_exact_staleness_boundary_succeeds() {
+    fn test_get_price_at_exact_staleness_boundary_reverts() {
         let env = Env::default();
         env.mock_all_auths();
         let threshold = 3600u64;
@@ -575,21 +578,22 @@ mod tests {
         let quote = Symbol::new(&env, "USDC");
         client.submit_price(&base, &quote, &10_000_000);
 
-        // Advance to exactly updated_at + threshold
+        // Advance to exactly updated_at + threshold — should now be stale
         env.ledger()
             .with_mut(|l| l.timestamp = submit_time + threshold);
         env.ledger()
             .with_mut(|l| l.timestamp = submit_time + threshold);
         let result = client.try_get_price(&base, &quote);
-        assert!(
-            result.is_ok(),
-            "expected Ok at exact boundary, got {result:?}"
+        assert_eq!(
+            result,
+            Err(Ok(OracleError::PriceStale)),
+            "expected PriceStale at exact boundary"
         );
     }
 
-    /// get_price() reverts when now == updated_at + threshold + 1 (one second past).
+    /// get_price() succeeds when now == updated_at + threshold - 1 (one second before boundary).
     #[test]
-    fn test_get_price_one_second_past_staleness_boundary_reverts() {
+    fn test_get_price_one_second_before_staleness_boundary_succeeds() {
         let env = Env::default();
         env.mock_all_auths();
         let threshold = 3600u64;
@@ -602,13 +606,14 @@ mod tests {
         let quote = Symbol::new(&env, "USDC");
         client.submit_price(&base, &quote, &10_000_000);
 
-        // One second past the threshold
+        // One second before the threshold — still valid
         env.ledger()
-            .with_mut(|l| l.timestamp = submit_time + threshold + 1);
-        env.ledger()
-            .with_mut(|l| l.timestamp = submit_time + threshold + 1);
+            .with_mut(|l| l.timestamp = submit_time + threshold - 1);
         let result = client.try_get_price(&base, &quote);
-        assert_eq!(result, Err(Ok(OracleError::PriceStale)));
+        assert!(
+            result.is_ok(),
+            "expected Ok one second before boundary, got {result:?}"
+        );
     }
 
     /// get_price_unsafe() succeeds at the boundary and one second past it.
