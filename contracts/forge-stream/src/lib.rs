@@ -348,6 +348,10 @@ impl ForgeStream {
     /// Temporarily halts token accrual. Recipient can still withdraw already-accrued tokens.
     /// Only callable by the stream's `sender`.
     ///
+    /// When paused, the stream's end_time is extended by the pause duration to ensure the
+    /// recipient receives the full promised payout. For example, if a stream is paused for 100s,
+    /// end_time is extended by 100s, so the recipient's total earnings remain unchanged.
+    ///
     /// # Parameters
     /// - `stream_id`: u64 stream identifier
     ///
@@ -400,6 +404,10 @@ impl ForgeStream {
     ///
     /// Restarts token accrual from the point it was paused. Only callable by the stream's `sender`.
     ///
+    /// When resumed, the stream's end_time is extended by the pause duration to ensure the
+    /// recipient receives the full promised payout. This maintains the invariant that total
+    /// recipient earnings = rate_per_second * (end_time - start_time - total_paused_time).
+    ///
     /// # Parameters
     /// - `stream_id`: u64 stream identifier
     ///
@@ -435,7 +443,9 @@ impl ForgeStream {
         }
 
         let now = env.ledger().timestamp();
-        stream.total_paused_time += now.saturating_sub(stream.paused_at);
+        let paused_duration = now.saturating_sub(stream.paused_at);
+        stream.total_paused_time += paused_duration;
+        stream.end_time = stream.end_time.saturating_add(paused_duration);
         stream.is_paused = false;
 
         env.storage()
@@ -481,7 +491,9 @@ impl ForgeStream {
         let now = env.ledger().timestamp();
         let streamed = Self::compute_streamed(&stream, now);
         let withdrawable = (streamed - stream.withdrawn).max(0);
-        let total = stream.rate_per_second * (stream.end_time - stream.start_time) as i128;
+        let raw_duration = stream.end_time.saturating_sub(stream.start_time);
+        let effective_duration = raw_duration.saturating_sub(stream.total_paused_time);
+        let total = stream.rate_per_second * effective_duration as i128;
         let remaining = (total - streamed).max(0);
         let is_active = !stream.cancelled && !stream.is_paused && now < stream.end_time;
         let is_finished = now >= stream.end_time;
@@ -1242,6 +1254,49 @@ mod tests {
 
         let result = client.try_resume_stream(&stream_id);
         assert_eq!(result, Err(Ok(StreamError::InvalidConfig)));
+    }
+
+    #[test]
+    fn test_pause_resume_maintains_total_payout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token = setup_token(&env, &sender, 100 * 1000);
+
+        // Create stream: 100 tokens/sec for 1000 seconds = 100,000 total
+        let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
+        
+        // Advance 100 seconds, then pause
+        env.ledger().with_mut(|l| l.timestamp += 100);
+        client.pause_stream(&stream_id);
+        
+        // Check status after pause
+        let status_paused = client.get_stream_status(&stream_id);
+        assert_eq!(status_paused.streamed, 10_000); // 100 * 100
+        
+        // Advance 200 seconds while paused (no accrual)
+        env.ledger().with_mut(|l| l.timestamp += 200);
+        
+        // Resume (extends end_time by 200 seconds)
+        client.resume_stream(&stream_id);
+        
+        // Check status after resume
+        let status_resumed = client.get_stream_status(&stream_id);
+        assert_eq!(status_resumed.streamed, 10_000); // Still 100 * 100
+        
+        // Advance to new end_time (1200)
+        env.ledger().with_mut(|l| l.timestamp += 900);
+        
+        let status = client.get_stream_status(&stream_id);
+        // Total streamed should be 100 * 1000 = 100,000 (full amount)
+        // Calculation: raw_elapsed = 1200 - 0 = 1200, paused_time = 200
+        // effective_elapsed = 1200 - 200 = 1000, streamed = 100 * 1000 = 100,000
+        assert_eq!(status.streamed, 100_000);
+        assert_eq!(status.remaining, 0);
+        assert!(status.is_finished);
     }
 
     #[test]
