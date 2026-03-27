@@ -90,6 +90,7 @@ pub enum GovernorError {
     AlreadyExecuted = 10,
     AlreadyCancelled = 11,
     InvalidConfig = 12,
+    InvalidWeight = 13,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -258,6 +259,10 @@ impl GovernorContract {
         let now = env.ledger().timestamp();
         if now > proposal.vote_end {
             return Err(GovernorError::VotingClosed);
+        }
+
+        if weight <= 0 {
+            return Err(GovernorError::InvalidWeight);
         }
 
         if support {
@@ -651,6 +656,44 @@ mod tests {
         client.vote(&voter, &pid, &true, &100);
         let result = client.try_vote(&voter, &pid, &true, &100);
         assert_eq!(result, Err(Ok(GovernorError::AlreadyVoted)));
+    }
+
+    #[test]
+    fn test_vote_with_zero_weight_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+
+        let result = client.try_vote(&voter, &pid, &true, &0);
+        assert_eq!(result, Err(Ok(GovernorError::InvalidWeight)));
+    }
+
+    #[test]
+    fn test_vote_with_negative_weight_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+
+        let result = client.try_vote(&voter, &pid, &false, &-1000);
+        assert_eq!(result, Err(Ok(GovernorError::InvalidWeight)));
     }
 
     #[test]
