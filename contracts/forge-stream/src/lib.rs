@@ -1796,4 +1796,78 @@ mod tests {
         assert_eq!(token.balance(&sender), 80_000);
         assert_eq!(token.balance(&recipient) + token.balance(&sender), total);
     }
+
+    /// Property test: withdrawn never exceeds compute_streamed across multiple withdraw() calls.
+    ///
+    /// Invariant: after every withdraw(), status.withdrawn <= status.streamed
+    /// Also asserts:
+    ///   - cumulative withdrawn == sum of individual withdraw() return values
+    ///   - final cumulative withdrawn == rate_per_second * duration_seconds
+    #[test]
+    fn test_withdrawn_never_exceeds_streamed_across_multiple_withdrawals() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        let sac = StellarAssetClient::new(&env, &token_id);
+
+        let rate: i128 = 100;
+        let duration: u64 = 1000;
+        let total = rate * duration as i128; // 100_000
+
+        sac.mint(&sender, &total);
+
+        // Start at t=0
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+
+        let checkpoints: [(u64, u64); 5] = [
+            (100, 100),   // 10% of duration
+            (250, 250),   // 25%
+            (500, 500),   // 50%
+            (750, 750),   // 75%
+            (1000, 1000), // 100%
+        ];
+
+        let mut cumulative_withdrawn: i128 = 0;
+
+        for (timestamp, _pct) in checkpoints.iter() {
+            env.ledger().with_mut(|l| l.timestamp = *timestamp);
+
+            let amount = client.withdraw(&stream_id);
+            cumulative_withdrawn += amount;
+
+            let status = client.get_stream_status(&stream_id);
+
+            // Core invariant: withdrawn must never exceed streamed
+            assert!(
+                status.withdrawn <= status.streamed,
+                "Invariant violated at t={}: withdrawn ({}) > streamed ({})",
+                timestamp,
+                status.withdrawn,
+                status.streamed,
+            );
+
+            // Cumulative return values must match stored withdrawn
+            assert_eq!(
+                status.withdrawn, cumulative_withdrawn,
+                "Cumulative mismatch at t={}: status.withdrawn={} vs sum={}",
+                timestamp, status.withdrawn, cumulative_withdrawn,
+            );
+        }
+
+        // After full duration: total withdrawn must equal rate * duration
+        assert_eq!(
+            cumulative_withdrawn, total,
+            "Final withdrawn {} != expected total {}",
+            cumulative_withdrawn, total,
+        );
+    }
 }
