@@ -49,7 +49,7 @@ pub struct Stream {
     /// Whether the stream is currently paused
     pub is_paused: bool,
     /// Timestamp when stream was last paused (if paused)
-    pub paused_at: u64,
+    pub paused_at: Option<u64>,
     /// Total seconds the stream has been paused
     pub total_paused_time: u64,
     /// Whether this stream is currently counted as active in the global counter
@@ -153,7 +153,7 @@ impl ForgeStream {
             cancelled: false,
             streamed_at_cancel: 0,
             is_paused: false,
-            paused_at: 0,
+            paused_at: None,
             total_paused_time: 0,
             counted_active: true,
         };
@@ -410,7 +410,7 @@ impl ForgeStream {
 
         let now = env.ledger().timestamp();
         stream.is_paused = true;
-        stream.paused_at = now;
+        stream.paused_at = Some(now);
 
         env.storage()
             .persistent()
@@ -468,10 +468,14 @@ impl ForgeStream {
         }
 
         let now = env.ledger().timestamp();
-        let paused_duration = now.saturating_sub(stream.paused_at);
+        let paused_at = stream
+            .paused_at
+            .expect("stream is paused but paused_at is missing");
+        let paused_duration = now.saturating_sub(paused_at);
         stream.total_paused_time += paused_duration;
         stream.end_time = stream.end_time.saturating_add(paused_duration);
         stream.is_paused = false;
+        stream.paused_at = None;
 
         env.storage()
             .persistent()
@@ -624,6 +628,7 @@ impl ForgeStream {
     /// Get all stream IDs for a given sender.
     ///
     /// Returns a vector of stream IDs where the specified address is the sender.
+    /// This list is append-only: cancelled streams are still included.
     /// Useful for wallets and dashboards to display all outgoing streams.
     ///
     /// # Parameters
@@ -656,6 +661,7 @@ impl ForgeStream {
     /// Get all stream IDs for a given recipient.
     ///
     /// Returns a vector of stream IDs where the specified address is the recipient.
+    /// This list is append-only: cancelled streams are still included.
     /// Useful for wallets and dashboards to display all incoming streams.
     ///
     /// # Parameters
@@ -697,7 +703,9 @@ impl ForgeStream {
         let raw_elapsed = effective_time.saturating_sub(stream.start_time);
         let mut paused_time = stream.total_paused_time;
         if stream.is_paused {
-            paused_time += effective_time.saturating_sub(stream.paused_at);
+            if let Some(paused_at) = stream.paused_at {
+                paused_time += effective_time.saturating_sub(paused_at);
+            }
         }
         let effective_elapsed = raw_elapsed.saturating_sub(paused_time);
         stream.rate_per_second * effective_elapsed as i128
@@ -1662,6 +1670,35 @@ mod tests {
         assert_eq!(streams.len(), 2);
         assert_eq!(streams.get(0).unwrap(), stream_id1);
         assert_eq!(streams.get(1).unwrap(), stream_id2);
+    }
+
+    #[test]
+    fn test_get_streams_includes_cancelled_streams() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+        StellarAssetClient::new(&env, &token_id).mint(&sender, &10_000_000i128);
+
+        let stream_id1 = client.create_stream(&sender, &token_id, &recipient, &100, &1000);
+        let stream_id2 = client.create_stream(&sender, &token_id, &recipient, &50, &800);
+
+        client.cancel_stream(&stream_id2);
+
+        let sender_streams = client.get_streams_by_sender(&sender);
+        assert_eq!(sender_streams.len(), 2);
+        assert_eq!(sender_streams.get(0).unwrap(), stream_id1);
+        assert_eq!(sender_streams.get(1).unwrap(), stream_id2);
+
+        let recipient_streams = client.get_streams_by_recipient(&recipient);
+        assert_eq!(recipient_streams.len(), 2);
+        assert_eq!(recipient_streams.get(0).unwrap(), stream_id1);
+        assert_eq!(recipient_streams.get(1).unwrap(), stream_id2);
     }
 
     #[test]

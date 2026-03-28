@@ -1018,6 +1018,45 @@ mod tests {
     }
 
     #[test]
+    fn test_transfer_admin_allows_new_admin_to_cancel_old_admin_cannot() {
+        use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+        use soroban_sdk::IntoVal;
+
+        let (env, contract_id, token_id, beneficiary, admin_a) = setup_with_token();
+        let client = ForgeVestingClient::new(&env, &contract_id);
+        client.initialize(&token_id, &beneficiary, &admin_a, &1_000_000, &100, &1000);
+
+        let admin_b = Address::generate(&env);
+        client.transfer_admin(&admin_b).expect("transfer_admin should succeed");
+
+        env.mock_auths(&[MockAuth {
+            address: &admin_a,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "cancel",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_cancel().is_err(), "old admin should not be able to cancel after transfer");
+
+        env.mock_auths(&[MockAuth {
+            address: &admin_b,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "cancel",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.cancel().expect("new admin should be able to cancel");
+
+        let tc = soroban_sdk::token::Client::new(&env, &token_id);
+        assert_eq!(tc.balance(&beneficiary), 0);
+        assert_eq!(tc.balance(&admin_b), 1_000_000);
+    }
+
+    #[test]
     fn test_transfer_admin_by_non_admin_fails() {
         use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
         use soroban_sdk::IntoVal;

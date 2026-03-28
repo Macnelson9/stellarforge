@@ -24,6 +24,10 @@ pub enum DataKey {
     /// Boolean flag per address — `true` means the address is an owner.
     /// Enables O(1) ownership checks without scanning the full owner Vec.
     IsOwner(Address),
+    /// Boolean flag for whether an address has approved a proposal.
+    HasApproved(u64, Address),
+    /// Boolean flag for whether an address has rejected a proposal.
+    HasRejected(u64, Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -40,10 +44,10 @@ pub struct Proposal {
     pub token: Address,
     /// Amount to transfer.
     pub amount: i128,
-    /// Addresses that have approved.
-    pub approvals: Vec<Address>,
-    /// Addresses that have rejected.
-    pub rejections: Vec<Address>,
+    /// Number of approvals recorded for this proposal.
+    pub approval_count: u32,
+    /// Number of rejections recorded for this proposal.
+    pub rejection_count: u32,
     /// Ledger timestamp when approval threshold was reached.
     pub approved_at: Option<u64>,
     /// Whether the proposal has been executed.
@@ -189,11 +193,8 @@ impl MultisigContract {
             .get(&DataKey::NextProposalId)
             .unwrap_or(0u64);
 
-        let mut approvals = Vec::new(&env);
-        approvals.push_back(proposer.clone());
-
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
-        let approved_at = if approvals.len() >= threshold {
+        let approved_at = if 1 >= threshold {
             Some(env.ledger().timestamp())
         } else {
             None
@@ -204,12 +205,16 @@ impl MultisigContract {
             to: to.clone(),
             token: token.clone(),
             amount,
-            approvals,
-            rejections: Vec::new(&env),
+            approval_count: 1,
+            rejection_count: 0,
             approved_at,
             executed: false,
             cancelled: false,
         };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::HasApproved(proposal_id, proposer.clone()), &true);
 
         env.storage()
             .persistent()
@@ -272,18 +277,31 @@ impl MultisigContract {
         if proposal.cancelled {
             return Err(MultisigError::AlreadyCancelled);
         }
-        if proposal.approvals.contains(&owner) || proposal.rejections.contains(&owner) {
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::HasApproved(proposal_id, owner.clone()))
+            .unwrap_or(false)
+            || env
+                .storage()
+                .persistent()
+                .get::<DataKey, bool>(&DataKey::HasRejected(proposal_id, owner.clone()))
+                .unwrap_or(false)
+        {
             return Err(MultisigError::AlreadyVoted);
         }
 
-        proposal.approvals.push_back(owner.clone());
+        proposal.approval_count = proposal.approval_count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HasApproved(proposal_id, owner.clone()), &true);
 
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
         // The is_none() guard ensures approved_at is set only once, when the threshold is first reached.
         // This prevents the timelock countdown from being reset if threshold changes in the future.
         // Currently, owners and threshold are immutable after initialize(), but this guard protects
         // against accidental resets if threshold mutability is added later.
-        if proposal.approvals.len() >= threshold && proposal.approved_at.is_none() {
+        if proposal.approval_count >= threshold && proposal.approved_at.is_none() {
             proposal.approved_at = Some(env.ledger().timestamp());
         }
 
@@ -293,7 +311,7 @@ impl MultisigContract {
 
         env.events().publish(
             (Symbol::new(&env, "proposal_approved"),),
-            (proposal_id, &owner, proposal.approvals.len()),
+            (proposal_id, &owner, proposal.approval_count),
         );
 
         Ok(())
@@ -336,18 +354,31 @@ impl MultisigContract {
         if proposal.executed {
             return Err(MultisigError::AlreadyExecuted);
         }
-        if proposal.approvals.contains(&owner) || proposal.rejections.contains(&owner) {
+        if env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::HasApproved(proposal_id, owner.clone()))
+            .unwrap_or(false)
+            || env
+                .storage()
+                .persistent()
+                .get::<DataKey, bool>(&DataKey::HasRejected(proposal_id, owner.clone()))
+                .unwrap_or(false)
+        {
             return Err(MultisigError::AlreadyVoted);
         }
 
-        proposal.rejections.push_back(owner.clone());
+        proposal.rejection_count = proposal.rejection_count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::HasRejected(proposal_id, owner.clone()), &true);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_rejected"),),
-            (proposal_id, &owner, proposal.rejections.len()),
+            (proposal_id, &owner, proposal.rejection_count),
         );
 
         Ok(())
@@ -444,7 +475,7 @@ impl MultisigContract {
     /// # Example
     /// ```text
     /// if let Some(p) = client.get_proposal(&id) {
-    ///     println!("approvals: {}", p.approvals.len());
+    ///     println!("approvals: {}", p.approval_count);
     /// }
     /// ```
     pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
@@ -558,7 +589,7 @@ impl MultisigContract {
         env.storage()
             .persistent()
             .get::<DataKey, Proposal>(&DataKey::Proposal(proposal_id))
-            .map(|proposal| proposal.approvals.len())
+            .map(|proposal| proposal.approval_count)
             .unwrap_or(0)
     }
 
@@ -865,15 +896,15 @@ mod tests {
 
         // Verify proposal has 2 rejections
         let proposal = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.rejections.len(), 2);
-        assert_eq!(proposal.approvals.len(), 1); // only proposer
+        assert_eq!(proposal.rejection_count, 2);
+        assert_eq!(proposal.approval_count, 1); // only proposer
 
         // Even if o4 approves, bringing total approvals to 2, it should not be executable
         // because 2 rejections means threshold of 3 can never be reached
         client.approve(&o4, &pid);
 
         let proposal = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.approvals.len(), 2);
+        assert_eq!(proposal.approval_count, 2);
 
         // Advance time past timelock
         env.ledger().with_mut(|l| l.timestamp = 7200);
@@ -885,7 +916,7 @@ mod tests {
         // Verify proposal state remains unchanged
         let proposal = client.get_proposal(&pid).unwrap();
         assert!(!proposal.executed);
-        assert_eq!(proposal.rejections.len(), 2);
+        assert_eq!(proposal.rejection_count, 2);
     }
 
     #[test]
@@ -906,13 +937,13 @@ mod tests {
 
         // Verify rejection state
         let proposal = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.rejections.len(), 2);
-        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.rejection_count, 2);
+        assert_eq!(proposal.approval_count, 1);
         assert!(proposal.approved_at.is_none()); // Never reached approval threshold
 
         // Proposal should remain in rejected state
         let proposal_after = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal_after.rejections.len(), 2);
+        assert_eq!(proposal_after.rejection_count, 2);
         assert!(!proposal_after.executed);
     }
 
@@ -1113,7 +1144,7 @@ mod tests {
         // propose auto-approves for proposer — threshold=1 is immediately met
         let pid = client.propose(&o1, &recipient, &token_id, &100);
         let proposal = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal.approvals.len(), 1);
+        assert_eq!(proposal.approval_count, 1);
         assert!(proposal.approved_at.is_some()); // threshold reached at proposal time
 
         // advance past timelock and execute
@@ -1141,7 +1172,7 @@ mod tests {
         client.reject(&o3, &pid);
         let proposal = client.get_proposal(&pid).unwrap();
         assert!(proposal.approved_at.is_some()); // still approved
-        assert_eq!(proposal.rejections.len(), 1);
+        assert_eq!(proposal.rejection_count, 1);
 
         // execution still succeeds after timelock
         env.ledger().with_mut(|l| l.timestamp = 3601);
@@ -1329,7 +1360,7 @@ mod tests {
         // propose() auto-approves proposer; threshold=1 is met immediately
         let pid = client.propose(&o1, &to, &token, &100);
         let proposal_after_propose = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal_after_propose.approvals.len(), 1);
+        assert_eq!(proposal_after_propose.approval_count, 1);
         let approved_at_from_propose = proposal_after_propose.approved_at;
         assert_eq!(approved_at_from_propose, Some(1000));
 
@@ -1339,7 +1370,7 @@ mod tests {
 
         // Verify approved_at was NOT overwritten
         let proposal_after_approve = client.get_proposal(&pid).unwrap();
-        assert_eq!(proposal_after_approve.approvals.len(), 2);
+        assert_eq!(proposal_after_approve.approval_count, 2);
         assert_eq!(
             proposal_after_approve.approved_at, approved_at_from_propose,
             "approved_at must not be overwritten by subsequent approve()"
