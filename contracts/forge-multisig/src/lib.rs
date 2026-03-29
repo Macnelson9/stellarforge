@@ -30,6 +30,8 @@ pub enum DataKey {
     HasApproved(u64, Address),
     /// Boolean flag for whether an address has rejected a proposal.
     HasRejected(u64, Address),
+    /// Total tokens committed to approved-but-not-yet-executed proposals per token address.
+    CommittedAmount(Address),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -75,6 +77,7 @@ pub enum MultisigError {
     InvalidThreshold = 10,
     InvalidAmount = 11,
     CannotCancel = 12,
+    InsufficientFunds = 13,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -231,6 +234,18 @@ impl MultisigContract {
             .persistent()
             .extend_ttl(&DataKey::NextProposalId, 31536000, 31536000);
 
+        // If threshold was met immediately (threshold=1), commit the amount now
+        if approved_at.is_some() {
+            let committed: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CommittedAmount(token.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::CommittedAmount(token.clone()), &(committed + amount));
+        }
+
         env.events().publish(
             (Symbol::new(&env, "proposal_created"),),
             (proposal_id, &proposer, &to, &token, amount),
@@ -306,6 +321,16 @@ impl MultisigContract {
         // against accidental resets if threshold mutability is added later.
         if proposal.approval_count >= threshold && proposal.approved_at.is_none() {
             proposal.approved_at = Some(env.ledger().timestamp());
+            // Track committed tokens to prevent over-commitment across concurrent proposals
+            let committed: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CommittedAmount(proposal.token.clone()))
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::CommittedAmount(proposal.token.clone()),
+                &(committed + proposal.amount),
+            );
         }
 
         env.storage()
@@ -454,11 +479,31 @@ impl MultisigContract {
             .set(&DataKey::Proposal(proposal_id), &proposal);
 
         let token_client = token::Client::new(&env, &proposal.token);
+
+        // Verify the treasury holds enough to cover all committed proposals
+        let committed: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CommittedAmount(proposal.token.clone()))
+            .unwrap_or(0);
+        let balance = token_client.balance(&env.current_contract_address());
+        if balance < committed {
+            return Err(MultisigError::InsufficientFunds);
+        }
+
         token_client.transfer(
             &env.current_contract_address(),
             &proposal.to,
             &proposal.amount,
         );
+
+        // Release the committed amount for this proposal
+        let new_committed = committed.saturating_sub(proposal.amount);
+        env.storage().instance().set(
+            &DataKey::CommittedAmount(proposal.token.clone()),
+            &new_committed,
+        );
+
         env.storage().instance().extend_ttl(17280, 34560);
 
         env.events().publish(
@@ -515,6 +560,18 @@ impl MultisigContract {
         // Allow proposer to cancel at any time before execution
         if proposal.proposer == owner {
             proposal.cancelled = true;
+            // Release committed amount if threshold had been reached
+            if proposal.approved_at.is_some() {
+                let committed: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CommittedAmount(proposal.token.clone()))
+                    .unwrap_or(0);
+                env.storage().instance().set(
+                    &DataKey::CommittedAmount(proposal.token.clone()),
+                    &committed.saturating_sub(proposal.amount),
+                );
+            }
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -541,6 +598,18 @@ impl MultisigContract {
         // If remaining possible approvals < threshold, it's impossible to pass
         if remaining_possible < threshold {
             proposal.cancelled = true;
+            // Release committed amount if threshold had been reached
+            if proposal.approved_at.is_some() {
+                let committed: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CommittedAmount(proposal.token.clone()))
+                    .unwrap_or(0);
+                env.storage().instance().set(
+                    &DataKey::CommittedAmount(proposal.token.clone()),
+                    &committed.saturating_sub(proposal.amount),
+                );
+            }
             env.storage()
                 .persistent()
                 .set(&DataKey::Proposal(proposal_id), &proposal);
@@ -685,6 +754,26 @@ impl MultisigContract {
             .persistent()
             .get::<DataKey, Proposal>(&DataKey::Proposal(proposal_id))
             .map(|proposal| proposal.approval_count)
+            .unwrap_or(0)
+    }
+
+    /// Return the total tokens committed to approved-but-not-yet-executed proposals
+    /// for a given token address.
+    ///
+    /// This value increases when a proposal reaches the approval threshold and decreases
+    /// when a proposal is executed or cancelled. It is used by [`execute`](Self::execute)
+    /// to verify the treasury holds enough tokens to cover all pending commitments before
+    /// transferring funds.
+    ///
+    /// # Parameters
+    /// - `token` — The token contract address to query.
+    ///
+    /// # Returns
+    /// `i128` — total committed tokens for `token`. Returns `0` if none committed.
+    pub fn get_committed_amount(env: Env, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CommittedAmount(token))
             .unwrap_or(0)
     }
 
@@ -1843,5 +1932,108 @@ mod tests {
         // An owner can propose successfully
         let result = client.try_propose(&owners[0], &to, &token, &100);
         assert!(result.is_ok());
+    }
+
+    // ── CommittedAmount / over-commitment tests ───────────────────────────────
+
+    fn setup_token(env: &Env, contract_id: &Address, amount: i128) -> Address {
+        use soroban_sdk::token::StellarAssetClient;
+        let token_admin = Address::generate(env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        StellarAssetClient::new(env, &token_id).mint(contract_id, &amount);
+        token_id
+    }
+
+    /// Two proposals approved against the same treasury cannot both drain it.
+    /// The second execute must fail with InsufficientFunds.
+    #[test]
+    fn test_two_proposals_cannot_double_drain_treasury() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone()], &2, &0);
+
+        // Treasury has 1000 tokens
+        let token_id = setup_token(&env, &contract_id, 1000);
+        let recipient = Address::generate(&env);
+
+        // Propose two transfers of 800 each — together they exceed the 1000 balance
+        let pid1 = client.propose(&o1, &recipient, &token_id, &800);
+        let pid2 = client.propose(&o1, &recipient, &token_id, &800);
+
+        // Approve both to threshold
+        client.approve(&o2, &pid1);
+        client.approve(&o2, &pid2);
+
+        // committed = 1600, balance = 1000 → first execute succeeds
+        let result1 = client.try_execute(&o1, &pid1);
+        assert!(result1.is_ok(), "first execute should succeed");
+
+        // After first execute: balance = 200, committed = 800 → second must fail
+        let result2 = client.try_execute(&o1, &pid2);
+        assert_eq!(result2, Err(Ok(MultisigError::InsufficientFunds)));
+    }
+
+    /// get_committed_amount tracks the lifecycle: 0 → committed → released on execute.
+    #[test]
+    fn test_committed_amount_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone()], &2, &0);
+
+        let token_id = setup_token(&env, &contract_id, 1000);
+        let recipient = Address::generate(&env);
+
+        assert_eq!(client.get_committed_amount(&token_id), 0);
+
+        let pid = client.propose(&o1, &recipient, &token_id, &300);
+        // Not yet at threshold — committed still 0
+        assert_eq!(client.get_committed_amount(&token_id), 0);
+
+        client.approve(&o2, &pid);
+        // Threshold reached — committed = 300
+        assert_eq!(client.get_committed_amount(&token_id), 300);
+
+        client.execute(&o1, &pid);
+        // Executed — committed back to 0
+        assert_eq!(client.get_committed_amount(&token_id), 0);
+    }
+
+    /// Cancelling an approved proposal releases its committed amount.
+    #[test]
+    fn test_cancel_approved_proposal_releases_committed_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone()], &2, &0);
+
+        let token_id = setup_token(&env, &contract_id, 1000);
+        let recipient = Address::generate(&env);
+
+        let pid = client.propose(&o1, &recipient, &token_id, &500);
+        client.approve(&o2, &pid);
+        assert_eq!(client.get_committed_amount(&token_id), 500);
+
+        // Proposer cancels — committed must be released
+        client.cancel(&o1, &pid);
+        assert_eq!(client.get_committed_amount(&token_id), 0);
     }
 }
