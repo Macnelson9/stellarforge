@@ -740,6 +740,67 @@ mod tests {
         assert_eq!(result, Err(Ok(MultisigError::InvalidThreshold)));
     }
 
+    /// TC: threshold > unique_owners.len() must return InvalidThreshold.
+    /// Verifies the boundary: 4-of-3 is rejected even though 3-of-3 is valid.
+    #[test]
+    fn test_initialize_threshold_exceeds_owners_returns_invalid_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        let o3 = Address::generate(&env);
+        let result = client.try_initialize(&vec![&env, o1, o2, o3], &4, &0);
+        assert_eq!(result, Err(Ok(MultisigError::InvalidThreshold)));
+    }
+
+    /// TC: unanimous 3-of-3 multisig — every owner must approve before execution.
+    ///
+    /// Steps:
+    /// 1. Initialize 3-of-3 with a 3600 s timelock.
+    /// 2. propose() — auto-approves o1 (1/3); approved_at must still be None.
+    /// 3. approve(o2) — 2/3; approved_at must still be None.
+    /// 4. approve(o3) — 3/3 hits threshold; approved_at must be Some(timestamp).
+    /// 5. Advance past timelock and execute — assert proposal.executed.
+    #[test]
+    fn test_unanimous_3of3_multisig() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        let o3 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &3, &3600);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let to = Address::generate(&env);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
+
+        // Step 2: propose — o1 auto-approves (1/3), threshold not yet reached
+        let pid = client.propose(&o1, &to, &token_id, &500);
+        assert!(client.get_proposal(&pid).unwrap().approved_at.is_none());
+
+        // Step 3: o2 approves (2/3), still not reached
+        client.approve(&o2, &pid);
+        assert!(client.get_proposal(&pid).unwrap().approved_at.is_none());
+
+        // Step 4: o3 approves (3/3), threshold reached
+        client.approve(&o3, &pid);
+        assert!(client.get_proposal(&pid).unwrap().approved_at.is_some());
+
+        // Step 5: advance past timelock and execute
+        env.ledger().with_mut(|l| l.timestamp = 1000 + 3600 + 1);
+        client.execute(&o1, &pid);
+        assert!(client.get_proposal(&pid).unwrap().executed);
+    }
+
     #[test]
     fn test_get_timelock_delay() {
         let env = Env::default();
