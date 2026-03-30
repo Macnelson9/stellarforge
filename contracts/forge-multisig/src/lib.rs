@@ -2036,4 +2036,60 @@ mod tests {
         client.cancel(&o1, &pid);
         assert_eq!(client.get_committed_amount(&token_id), 0);
     }
+
+    /// Issue #266: execute() returns InsufficientFunds when the contract holds no tokens.
+    #[test]
+    fn test_execute_returns_insufficient_funds_when_no_tokens() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone()], &2, &0);
+
+        // Register a token but do NOT mint any to the contract
+        let token_id = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        let recipient = Address::generate(&env);
+
+        let pid = client.propose(&o1, &recipient, &token_id, &500);
+        client.approve(&o2, &pid);
+
+        // Contract has zero balance — execute must return InsufficientFunds
+        let result = client.try_execute(&o1, &pid);
+        assert_eq!(result, Err(Ok(MultisigError::InsufficientFunds)));
+    }
+
+    /// Issue #266: execute() succeeds when the contract holds exactly the required balance.
+    #[test]
+    fn test_execute_succeeds_with_exact_required_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        client.initialize(&vec![&env, o1.clone(), o2.clone()], &2, &0);
+
+        // Mint exactly the proposed amount to the contract
+        let token_id = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
+        let recipient = Address::generate(&env);
+
+        let pid = client.propose(&o1, &recipient, &token_id, &500);
+        client.approve(&o2, &pid);
+
+        // Contract has exactly 500 — execute must succeed
+        let result = client.try_execute(&o1, &pid);
+        assert!(result.is_ok(), "execute should succeed with exact balance");
+        assert!(client.get_proposal(&pid).unwrap().executed);
+    }
 }

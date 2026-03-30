@@ -298,9 +298,16 @@ impl ForgeStream {
     ///
     /// # Example
     /// ```rust,ignore
-    /// // Stream: 100/sec for 3600s, cancel after 100s:
-    /// // recipient gets 10,000 (100*100), sender refunded 350,000
+    /// // Stream: 100/sec for 3600s = 360,000 total tokens, cancel after 100s:
+    /// // streamed = 100 * 100 = 10,000
+    /// // recipient gets 10,000 (streamed - withdrawn)
+    /// // sender refunded 350,000 (total - streamed)
     /// forge_stream.cancel_stream(env, stream_id)?;
+    ///
+    /// // With a pause: 100/sec for 3600s, paused for 200s, cancel after 300s wall-clock:
+    /// // effective elapsed = 300 - 200 paused = 100s → streamed = 10,000
+    /// // recipient gets 10,000, sender refunded 350,000
+    /// // Invariant: withdrawable + returnable == total (360,000)
     /// ```rust,ignore
     ///
     /// # Errors
@@ -326,6 +333,18 @@ impl ForgeStream {
         let withdrawable = (streamed - stream.withdrawn).max(0);
         let total = stream.rate_per_second * (stream.end_time - stream.start_time) as i128;
         let returnable = total - streamed;
+
+        // Sanity check: all tokens must be accounted for (no tokens created or destroyed).
+        // withdrawable covers accrued-but-unwithdrawn tokens; returnable covers unstreamed tokens.
+        // Together they must equal the total deposited at stream creation.
+        debug_assert_eq!(
+            withdrawable + returnable,
+            total,
+            "cancel invariant violated: withdrawable({}) + returnable({}) != total({})",
+            withdrawable,
+            returnable,
+            total
+        );
 
         if stream.counted_active {
             Self::set_active_streams_count(
@@ -437,6 +456,11 @@ impl ForgeStream {
     /// recipient receives the full promised payout. This maintains the invariant that total
     /// recipient earnings = rate_per_second * (end_time - start_time - total_paused_time).
     ///
+    /// The paused duration is capped at `end_time` to avoid over-counting paused time when
+    /// `resume_stream()` is called after `end_time` has already passed. This keeps
+    /// `total_paused_time` consistent with the `effective_time.min(end_time)` cap used in
+    /// `compute_streamed()`.
+    ///
     /// # Parameters
     /// - `stream_id`: u64 stream identifier
     ///
@@ -447,7 +471,7 @@ impl ForgeStream {
     /// - `StreamNotFound`
     /// - `Unauthorized` (not sender)
     /// - `AlreadyCancelled`
-    /// - `StreamFinished`
+    /// - `StreamFinished` (called after end_time)
     /// - `InvalidConfig` (not paused)
     pub fn resume_stream(env: Env, stream_id: u64) -> Result<(), StreamError> {
         Self::validate_stream_id(&env, stream_id)?;
@@ -476,7 +500,10 @@ impl ForgeStream {
         let paused_at = stream
             .paused_at
             .expect("stream is paused but paused_at is missing");
-        let paused_duration = now.saturating_sub(paused_at);
+        // Cap paused duration at end_time to stay consistent with compute_streamed(),
+        // which uses effective_time = now.min(end_time) when accumulating paused time.
+        let effective_now = now.min(stream.end_time);
+        let paused_duration = effective_now.saturating_sub(paused_at);
         stream.total_paused_time += paused_duration;
         stream.end_time = stream.end_time.saturating_add(paused_duration);
         stream.is_paused = false;
@@ -2450,5 +2477,142 @@ mod tests {
 
         let result = client.try_extend_stream(&stream_id, &0);
         assert_eq!(result, Err(Ok(StreamError::InvalidConfig)));
+    }
+
+    /// Issue #265: stream paused before end_time, end_time passes, then resume is called.
+    /// total_paused_time must be capped at end_time so compute_streamed() returns the full amount.
+    ///
+    /// Timeline:
+    ///   t=0    create stream (rate=100, duration=1000, total=100_000, end_time=1000)
+    ///   t=500  pause (streamed = 50_000)
+    ///   t=1500 resume (end_time already passed; paused duration capped at 1000-500=500)
+    ///          end_time extended by 500 → new end_time = 1500
+    ///   t=1500 compute_streamed should return 100_000 (full amount)
+    #[test]
+    fn test_resume_after_end_time_caps_paused_duration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let rate: i128 = 100;
+        let duration: u64 = 1000;
+        let total = rate * duration as i128; // 100_000
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&sender, &total);
+
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+
+        // t=500: pause — 500s of active time → streamed = 50_000
+        env.ledger().with_mut(|l| l.timestamp = 500);
+        client.pause_stream(&stream_id);
+
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(status.streamed, 50_000);
+
+        // t=1500: resume — end_time (1000) has already passed
+        // paused duration must be capped at end_time - paused_at = 1000 - 500 = 500
+        // end_time extended by 500 → new end_time = 1500
+        env.ledger().with_mut(|l| l.timestamp = 1500);
+        client.resume_stream(&stream_id);
+
+        // At t=1500 (== new end_time), full 100_000 should be streamed
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(
+            status.streamed, total,
+            "streamed should equal total after overdue resume; got {}",
+            status.streamed
+        );
+        assert!(status.is_finished);
+    }
+
+    /// Issue #268: cancel_stream() doc comment example — 100/sec for 3600s, cancel after 100s.
+    /// Verifies the exact numbers: recipient gets 10,000, sender refunded 350,000, total = 360,000.
+    #[test]
+    fn test_cancel_stream_doc_comment_example() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let rate: i128 = 100;
+        let duration: u64 = 3600;
+        let total = rate * duration as i128; // 360_000
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        let token = soroban_sdk::token::Client::new(&env, &token_id);
+        sac.mint(&sender, &total);
+
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+
+        // Cancel after 100s: streamed = 100 * 100 = 10,000
+        env.ledger().with_mut(|l| l.timestamp = 100);
+        client.cancel_stream(&stream_id);
+
+        assert_eq!(token.balance(&recipient), 10_000, "recipient should get 10,000");
+        assert_eq!(token.balance(&sender), 350_000, "sender should be refunded 350,000");
+        assert_eq!(
+            token.balance(&recipient) + token.balance(&sender),
+            total,
+            "withdrawable + returnable must equal total"
+        );
+    }
+
+    /// Issue #268: cancel_stream() with a paused stream — paused time is excluded from streamed.
+    /// Verifies withdrawable + returnable == total invariant holds with paused time.
+    #[test]
+    fn test_cancel_paused_stream_invariant() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let rate: i128 = 100;
+        let duration: u64 = 3600;
+        let total = rate * duration as i128; // 360_000
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        let token = soroban_sdk::token::Client::new(&env, &token_id);
+        sac.mint(&sender, &total);
+
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+
+        // t=100: pause — 100s active → streamed = 10,000
+        env.ledger().with_mut(|l| l.timestamp = 100);
+        client.pause_stream(&stream_id);
+
+        // t=300: cancel while paused — paused for 200s, streamed still = 10,000
+        env.ledger().with_mut(|l| l.timestamp = 300);
+        client.cancel_stream(&stream_id);
+
+        // recipient gets 10,000 (streamed), sender gets 350,000 (unstreamed)
+        assert_eq!(token.balance(&recipient), 10_000);
+        assert_eq!(token.balance(&sender), 350_000);
+        assert_eq!(
+            token.balance(&recipient) + token.balance(&sender),
+            total,
+            "withdrawable + returnable must equal total even with paused time"
+        );
     }
 }

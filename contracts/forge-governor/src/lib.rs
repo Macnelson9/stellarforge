@@ -34,6 +34,12 @@ pub struct GovernorConfig {
     /// Address authorized to initialize the contract (must call initialize()).
     pub admin: Address,
     /// Token used for voting weight.
+    ///
+    /// Must be a valid Soroban token contract address that implements the token interface.
+    /// This address is used in `vote()` to verify voter balances (1 token = 1 vote).
+    /// Passing an invalid or non-token address will not be caught at initialization time —
+    /// it will only fail when `vote()` attempts to call `balance()` on the address.
+    /// Callers are responsible for ensuring this is a legitimate token contract.
     pub vote_token: Address,
     /// Seconds a proposal is open for voting.
     pub voting_period: u64,
@@ -176,6 +182,13 @@ impl GovernorContract {
             return Err(GovernorError::AlreadyInitialized);
         }
         if config.quorum == 0 || config.voting_period == 0 {
+            return Err(GovernorError::InvalidConfig);
+        }
+        // Sanity-check: vote_token must not be the same address as admin.
+        // A misconfigured vote_token (e.g. admin address used by mistake) would pass
+        // initialization silently but fail at vote() time. This catches the most obvious
+        // misconfiguration early with a descriptive error.
+        if config.vote_token == config.admin {
             return Err(GovernorError::InvalidConfig);
         }
         env.storage().instance().set(&DataKey::Config, &config);
@@ -851,11 +864,11 @@ mod tests {
         let contract_id = env.register_contract(None, GovernorContract);
         let client = GovernorContractClient::new(env, &contract_id);
         let admin = Address::generate(env);
-        let token_admin = Address::generate(env);
-        let token = env.register_stellar_asset_contract(token_admin);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
         let config = GovernorConfig {
-            vote_token: token_id,
-            admin,
+            admin: admin.clone(),
             vote_token: token,
             voting_period: 3600,
             quorum: 100,
@@ -870,10 +883,12 @@ mod tests {
     fn setup_with_token(env: &Env) -> (GovernorContractClient<'_>, Address) {
         let contract_id = env.register_contract(None, GovernorContract);
         let client = GovernorContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
         let token_id = env
             .register_stellar_asset_contract_v2(Address::generate(env))
             .address();
         let config = GovernorConfig {
+            admin: admin.clone(),
             vote_token: token_id.clone(),
             voting_period: 3600,
             quorum: 100,
@@ -897,8 +912,9 @@ mod tests {
 
         let admin = Address::generate(&env);
         let attacker = Address::generate(&env);
-        let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract(token_admin);
+        let token = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
 
         // Attacker tries to initialize with their own config
         let malicious_config = GovernorConfig {
@@ -962,10 +978,6 @@ mod tests {
             &String::from_str(&env, "A test"),
         );
 
-        let config = client.get_config().unwrap();
-        let token_client = token::Client::new(&env, &config.vote_token);
-        token_client.transfer(&token_client.address, &voter, &500);
-
         client.vote(&voter, &pid, &VoteDirection::For, &200);
 
         env.ledger().with_mut(|l| l.timestamp = 5000);
@@ -977,20 +989,17 @@ mod tests {
     fn test_vote_with_excessive_weight_fails() {
         let env = Env::default();
         env.mock_all_auths();
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
+        mint(&env, &token_id, &voter, 100);
 
         let pid = client.propose(
             &proposer,
             &String::from_str(&env, "Test Proposal"),
             &String::from_str(&env, "A test"),
         );
-
-        let config = client.get_config().unwrap();
-        let token_client = token::Client::new(&env, &config.vote_token);
-        token_client.transfer(&token_client.address, &voter, &100);
 
         // Try to vote with 200 weight when only 100 balance
         let result = client.try_vote(&voter, &pid, &VoteDirection::For, &200);
@@ -1051,9 +1060,8 @@ mod tests {
         );
 
         let voter = Address::generate(&env);
-        client.vote(&voter, &pid, &VoteDirection::For, &50);
         mint(&env, &token_id, &voter, 50);
-        client.vote(&voter, &pid, &true, &50);
+        client.vote(&voter, &pid, &VoteDirection::For, &50);
 
         env.ledger().with_mut(|l| l.timestamp = 5000);
         let state = client.finalize(&pid);
@@ -1167,9 +1175,8 @@ mod tests {
 
         // Vote with weight below quorum (quorum = 100)
         let voter = Address::generate(&env);
-        client.vote(&voter, &pid, &VoteDirection::For, &50);
         mint(&env, &token_id, &voter, 50);
-        client.vote(&voter, &pid, &true, &50);
+        client.vote(&voter, &pid, &VoteDirection::For, &50);
 
         env.ledger().with_mut(|l| l.timestamp = 5000);
         let state = client.finalize(&pid);
@@ -1193,12 +1200,10 @@ mod tests {
         // Cast votes that exactly meet quorum (60 + 40 = 100)
         let voter1 = Address::generate(&env);
         let voter2 = Address::generate(&env);
-        client.vote(&voter1, &pid, &VoteDirection::For, &60);
-        client.vote(&voter2, &pid, &VoteDirection::For, &40);
         mint(&env, &token_id, &voter1, 60);
         mint(&env, &token_id, &voter2, 40);
-        client.vote(&voter1, &pid, &true, &60);
-        client.vote(&voter2, &pid, &true, &40);
+        client.vote(&voter1, &pid, &VoteDirection::For, &60);
+        client.vote(&voter2, &pid, &VoteDirection::For, &40);
 
         // Finalize after the voting period and verify it passes.
         env.ledger().with_mut(|l| l.timestamp = 5000);
@@ -1215,12 +1220,10 @@ mod tests {
         // Cast votes just below quorum (60 + 39 = 99)
         let voter3 = Address::generate(&env);
         let voter4 = Address::generate(&env);
-        client.vote(&voter3, &pid2, &VoteDirection::For, &60);
-        client.vote(&voter4, &pid2, &VoteDirection::For, &39);
         mint(&env, &token_id, &voter3, 60);
         mint(&env, &token_id, &voter4, 39);
-        client.vote(&voter3, &pid2, &true, &60);
-        client.vote(&voter4, &pid2, &true, &39);
+        client.vote(&voter3, &pid2, &VoteDirection::For, &60);
+        client.vote(&voter4, &pid2, &VoteDirection::For, &39);
 
         // Finalize after the voting period and verify it fails.
         // pid2 was created at t=5000, so vote_end = 5000 + 3600 = 8600
@@ -1244,9 +1247,8 @@ mod tests {
         );
 
         let voter = Address::generate(&env);
-        client.vote(&voter, &pid, &VoteDirection::For, &100);
         mint(&env, &token_id, &voter, 100);
-        client.vote(&voter, &pid, &true, &100);
+        client.vote(&voter, &pid, &VoteDirection::For, &100);
 
         env.ledger().with_mut(|l| l.timestamp = 5000);
         let state = client.finalize(&pid);
@@ -1293,9 +1295,8 @@ mod tests {
         env.ledger().with_mut(|l| l.timestamp = 5000);
 
         let voter = Address::generate(&env);
-        let result = client.try_vote(&voter, &pid, &VoteDirection::For, &100);
         mint(&env, &token_id, &voter, 100);
-        let result = client.try_vote(&voter, &pid, &true, &100);
+        let result = client.try_vote(&voter, &pid, &VoteDirection::For, &100);
         assert!(matches!(result, Err(Ok(GovernorError::VotingClosed))));
     }
 
@@ -1429,11 +1430,12 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
         let executor = Address::generate(&env);
+        mint(&env, &token_id, &voter, 200);
 
         let pid = client.propose(
             &proposer,
@@ -1685,11 +1687,13 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env); // quorum = 100, voting_period = 3600
+        let (client, token_id) = setup_with_token(&env); // quorum = 100, voting_period = 3600
 
         let proposer = Address::generate(&env);
         let yes_voter = Address::generate(&env);
         let no_voter = Address::generate(&env);
+        mint(&env, &token_id, &yes_voter, 100);
+        mint(&env, &token_id, &no_voter, 100);
 
         let pid = client.propose(
             &proposer,
@@ -1729,11 +1733,13 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let yes_voter = Address::generate(&env);
         let no_voter = Address::generate(&env);
+        mint(&env, &token_id, &yes_voter, 100);
+        mint(&env, &token_id, &no_voter, 101);
 
         let pid = client.propose(
             &proposer,
@@ -1756,11 +1762,13 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let yes_voter = Address::generate(&env);
         let no_voter = Address::generate(&env);
+        mint(&env, &token_id, &yes_voter, 101);
+        mint(&env, &token_id, &no_voter, 100);
 
         let pid = client.propose(
             &proposer,
@@ -1785,10 +1793,11 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env); // voting_period = 3600, quorum = 100
+        let (client, token_id) = setup_with_token(&env); // voting_period = 3600, quorum = 100
 
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
+        mint(&env, &token_id, &voter, 200);
 
         // Create 25 proposals at t=0
         let mut ids: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
@@ -1881,10 +1890,11 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 1000);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
+        mint(&env, &token_id, &voter, 200);
         let pid = client.propose(
             &proposer,
             &String::from_str(&env, "State Test"),
@@ -1947,7 +1957,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 1000);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let pid = client.propose(
@@ -1958,6 +1968,8 @@ mod tests {
 
         let voter_a = Address::generate(&env);
         let voter_b = Address::generate(&env);
+        mint(&env, &token_id, &voter_a, 300);
+        mint(&env, &token_id, &voter_b, 100);
         client.vote(&voter_a, &pid, &VoteDirection::For, &300);
         client.vote(&voter_b, &pid, &VoteDirection::Against, &100);
 
@@ -2003,10 +2015,11 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 1000);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
+        mint(&env, &token_id, &voter, 200);
         let pid = client.propose(
             &proposer,
             &String::from_str(&env, "Test"),
@@ -2027,10 +2040,11 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
+        mint(&env, &token_id, &voter, 200);
         let pid = client.propose(
             &proposer,
             &String::from_str(&env, "Test"),
@@ -2054,11 +2068,12 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
         let executor = Address::generate(&env);
+        mint(&env, &token_id, &voter, 200);
         let pid = client.propose(
             &proposer,
             &String::from_str(&env, "Test"),
@@ -2318,11 +2333,13 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env); // quorum = 100
+        let (client, token_id) = setup_with_token(&env); // quorum = 100
 
         let proposer = Address::generate(&env);
         let yes_voter = Address::generate(&env);
         let abstain_voter = Address::generate(&env);
+        mint(&env, &token_id, &yes_voter, 60);
+        mint(&env, &token_id, &abstain_voter, 40);
 
         let pid = client.propose(
             &proposer,
@@ -2350,10 +2367,11 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env); // quorum = 100
+        let (client, token_id) = setup_with_token(&env); // quorum = 100
 
         let proposer = Address::generate(&env);
         let abstain_voter = Address::generate(&env);
+        mint(&env, &token_id, &abstain_voter, 200);
 
         let pid = client.propose(
             &proposer,
@@ -2375,10 +2393,11 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env); // quorum = 100
+        let (client, token_id) = setup_with_token(&env); // quorum = 100
 
         let proposer = Address::generate(&env);
         let abstain_voter = Address::generate(&env);
+        mint(&env, &token_id, &abstain_voter, 50);
 
         let pid = client.propose(
             &proposer,
@@ -2399,7 +2418,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
-        let client = setup(&env);
+        let (client, token_id) = setup_with_token(&env);
 
         let proposer = Address::generate(&env);
         let pid = client.propose(
@@ -2411,6 +2430,9 @@ mod tests {
         let v1 = Address::generate(&env);
         let v2 = Address::generate(&env);
         let v3 = Address::generate(&env);
+        mint(&env, &token_id, &v1, 100);
+        mint(&env, &token_id, &v2, 50);
+        mint(&env, &token_id, &v3, 75);
         client.vote(&v1, &pid, &VoteDirection::For, &100);
         client.vote(&v2, &pid, &VoteDirection::Against, &50);
         client.vote(&v3, &pid, &VoteDirection::Abstain, &75);
@@ -2420,5 +2442,41 @@ mod tests {
         assert_eq!(tally.no_votes, 50);
         assert_eq!(tally.abstain_votes, 75);
         assert_eq!(tally.total_votes, 225);
+    }
+
+    /// Issue #267: initialize() with vote_token == admin (clearly invalid config) must return InvalidConfig.
+    ///
+    /// A real token contract address is required for vote_token. Using the admin address
+    /// as vote_token is a clear misconfiguration that should be caught at initialization.
+    #[test]
+    fn test_initialize_with_invalid_vote_token_returns_invalid_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, GovernorContract);
+        let client = GovernorContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        // Use admin address as vote_token — clearly invalid
+        let config = GovernorConfig {
+            admin: admin.clone(),
+            vote_token: admin.clone(), // same as admin — invalid
+            voting_period: 3600,
+            quorum: 100,
+            timelock_delay: 86400,
+        };
+
+        let result = client.try_initialize(&config);
+        assert_eq!(
+            result,
+            Err(Ok(GovernorError::InvalidConfig)),
+            "initialize with vote_token == admin should return InvalidConfig"
+        );
+
+        // Contract must remain uninitialized
+        assert!(
+            client.get_config().is_none(),
+            "config should not be set after failed initialize"
+        );
     }
 }
