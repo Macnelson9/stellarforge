@@ -390,8 +390,9 @@ impl GovernorContract {
     ///
     /// Evaluates the vote totals against the configured quorum and sets the
     /// proposal state to [`ProposalState::Passed`] or [`ProposalState::Failed`].
-    /// If passed, records the current timestamp in `passed_at` to start the
-    /// timelock countdown. Can be called by anyone.
+    /// If passed, records `vote_end` in `passed_at` to start the timelock
+    /// countdown from when voting ended, not when `finalize` was called.
+    /// Can be called by anyone.
     ///
     /// # Parameters
     /// - `proposal_id` — ID of the proposal to finalize.
@@ -436,7 +437,7 @@ impl GovernorContract {
 
         if total_votes >= config.quorum && proposal.votes_for > proposal.votes_against {
             proposal.state = ProposalState::Passed;
-            proposal.passed_at = Some(now);
+            proposal.passed_at = Some(proposal.vote_end);
         } else {
             proposal.state = ProposalState::Failed;
         }
@@ -1378,12 +1379,49 @@ mod tests {
         let result = client.try_execute(&executor, &pid);
         assert_eq!(result, Err(Ok(GovernorError::TimelockNotElapsed)));
 
-        // Ensure execution succeeds after the timelock delay elapsed
-        env.ledger().with_mut(|l| l.timestamp = 5000 + 86400);
+        // Timelock starts from vote_end (3600), not finalize time (5000)
+        env.ledger().with_mut(|l| l.timestamp = 3600 + 86400);
         client.execute(&executor, &pid);
 
         let proposal = client.get_proposal(&pid);
         assert_eq!(proposal.state, ProposalState::Executed);
+    }
+
+    #[test]
+    fn test_late_finalize_timelock_starts_from_vote_end() {
+        // finalize() called 1000s after vote_end; execution window must be
+        // vote_end + timelock_delay, not finalize_time + timelock_delay.
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (client, token_id) = setup_with_token(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let executor = Address::generate(&env);
+        mint(&env, &token_id, &voter, 200);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+        client.vote(&voter, &pid, &VoteDirection::For, &200);
+
+        // Finalize 1000 seconds after vote_end (3600)
+        let finalize_time = 3600 + 1000;
+        env.ledger().with_mut(|l| l.timestamp = finalize_time);
+        client.finalize(&pid);
+
+        // Still locked at finalize_time + timelock_delay
+        env.ledger().with_mut(|l| l.timestamp = finalize_time + 86400);
+        let result = client.try_execute(&executor, &pid);
+        assert_eq!(result, Err(Ok(GovernorError::TimelockNotElapsed)));
+
+        // Executable at vote_end + timelock_delay
+        env.ledger().with_mut(|l| l.timestamp = 3600 + 86400);
+        client.execute(&executor, &pid);
+        assert_eq!(client.get_proposal(&pid).state, ProposalState::Executed);
     }
 
     #[test]
