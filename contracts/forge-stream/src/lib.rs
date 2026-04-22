@@ -152,7 +152,11 @@ impl ForgeStream {
             .unwrap_or(0_u64);
 
         let now = env.ledger().timestamp();
-        let total = rate_per_second * duration_seconds as i128;
+        // Guard against overflow: rate * duration must not exceed i128::MAX.
+        // If it would, reject the stream rather than silently truncate.
+        let total = rate_per_second
+            .checked_mul(duration_seconds as i128)
+            .ok_or(StreamError::InvalidConfig)?;
 
         // Pull total tokens from sender into contract
         let token_client = token::Client::new(&env, &token);
@@ -858,7 +862,16 @@ impl ForgeStream {
             }
         }
         let effective_elapsed = raw_elapsed.saturating_sub(paused_time);
-        stream.rate_per_second * effective_elapsed as i128
+        // Overflow protection: if rate * elapsed would exceed i128::MAX, cap at
+        // total (rate * duration) which is the maximum tokens this stream can ever
+        // release. This prevents silent truncation on extreme rate/elapsed combos.
+        let duration = stream.end_time.saturating_sub(stream.start_time);
+        let total = stream.rate_per_second * duration as i128;
+        stream
+            .rate_per_second
+            .checked_mul(effective_elapsed as i128)
+            .unwrap_or(total)
+            .min(total)
     }
 
     fn active_streams_count(env: &Env) -> u64 {
@@ -1238,6 +1251,46 @@ mod tests {
         assert_eq!(status.streamed + status.remaining, total);
 
         env.ledger().with_mut(|l| l.timestamp += 500);
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(status.streamed, total);
+        assert_eq!(status.remaining, 0);
+        assert_eq!(status.streamed + status.remaining, total);
+    }
+
+    /// rate = i128::MAX / 2, duration = 3: intermediate multiplication would
+    /// overflow without checked_mul. Verifies compute_streamed() caps at total
+    /// and never panics or returns a corrupted value.
+    #[test]
+    fn test_high_rate_overflow_protection() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let duration = 3u64;
+        let rate = i128::MAX / 2; // rate * 2 fits in i128, but rate * 3 overflows
+        let total = rate * duration as i128; // safe: (MAX/2) * 3 < MAX
+        let token = setup_token(&env, &sender, total);
+
+        let stream_id = client.create_stream(&sender, &token, &recipient, &rate, &duration);
+
+        // At t=1: rate * 1 is fine
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(status.streamed, rate);
+        assert!(status.streamed <= total);
+
+        // At t=2: rate * 2 is fine
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        let status = client.get_stream_status(&stream_id);
+        assert_eq!(status.streamed, rate * 2);
+        assert!(status.streamed <= total);
+
+        // At t=3 (end): rate * 3 would overflow i128 without checked_mul;
+        // result must be capped at total, not panic or wrap.
+        env.ledger().with_mut(|l| l.timestamp += 1);
         let status = client.get_stream_status(&stream_id);
         assert_eq!(status.streamed, total);
         assert_eq!(status.remaining, 0);
