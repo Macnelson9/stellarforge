@@ -2301,8 +2301,8 @@ mod tests {
         // Both should be pending
         let pending = client.get_pending_proposals();
         assert_eq!(pending.len(), 2);
-        assert!(pending.contains(&pid1));
-        assert!(pending.contains(&pid2));
+        assert!(pending.contains(pid1));
+        assert!(pending.contains(pid2));
 
         // Cancel the first proposal
         client.cancel_proposal(&proposer, &pid1);
@@ -2310,8 +2310,8 @@ mod tests {
         // Only the second proposal should be pending now
         let pending = client.get_pending_proposals();
         assert_eq!(pending.len(), 1);
-        assert!(!pending.contains(&pid1));
-        assert!(pending.contains(&pid2));
+        assert!(!pending.contains(pid1));
+        assert!(pending.contains(pid2));
     }
 
     /// Test cancel already cancelled proposal: cannot cancel a proposal twice

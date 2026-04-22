@@ -44,7 +44,8 @@ pub struct Proposal {
     pub proposer: Address,
     /// Destination address for the transfer.
     pub to: Address,
-    /// Token address.
+    /// Token address. For native XLM proposals this holds the SAC address of
+    /// the native asset and `is_native` is set to `true`.
     pub token: Address,
     /// Amount to transfer.
     pub amount: i128,
@@ -58,6 +59,10 @@ pub struct Proposal {
     pub executed: bool,
     /// Whether the proposal has been cancelled.
     pub cancelled: bool,
+    /// Whether this is a native XLM transfer proposal.
+    /// When `true`, `execute()` uses the native asset SAC address stored in
+    /// `token` rather than a custom Soroban token contract.
+    pub is_native: bool,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -216,6 +221,7 @@ impl MultisigContract {
             approved_at,
             executed: false,
             cancelled: false,
+            is_native: false,
         };
 
         env.storage()
@@ -249,6 +255,110 @@ impl MultisigContract {
         env.events().publish(
             (Symbol::new(&env, "proposal_created"),),
             (proposal_id, &proposer, &to, &token, amount),
+        );
+
+        Ok(proposal_id)
+    }
+
+    /// Propose a native XLM transfer from the treasury.
+    ///
+    /// Identical to [`propose`](Self::propose) but marks the proposal as a
+    /// native XLM transfer (`is_native = true`). The contract must hold
+    /// sufficient native XLM balance before `execute()` is called.
+    ///
+    /// On Soroban, native XLM is accessed through the Stellar Asset Contract
+    /// (SAC) for the native asset. The SAC exposes the same `token::Client`
+    /// interface as any other Soroban token, so `execute()` handles both cases
+    /// identically — the `is_native` flag is a semantic marker for callers.
+    ///
+    /// # Parameters
+    /// - `proposer` — An owner address submitting the proposal.
+    /// - `to` — Destination address that will receive XLM if executed.
+    /// - `xlm_token` — Address of the native asset SAC contract.
+    /// - `amount` — Stroops to transfer (1 XLM = 10,000,000 stroops). Must be > 0.
+    ///
+    /// # Returns
+    /// `Ok(proposal_id)` — the unique ID assigned to the new proposal.
+    ///
+    /// # Errors
+    /// - [`MultisigError::Unauthorized`] — `proposer` is not in the owner list.
+    /// - [`MultisigError::InvalidAmount`] — `amount` is ≤ 0.
+    ///
+    /// # Example
+    /// ```text
+    /// // Transfer 10 XLM (100_000_000 stroops) to recipient
+    /// let id = client.propose_xlm(&owner, &recipient, &xlm_sac_address, &100_000_000);
+    /// ```
+    pub fn propose_xlm(
+        env: Env,
+        proposer: Address,
+        to: Address,
+        xlm_token: Address,
+        amount: i128,
+    ) -> Result<u64, MultisigError> {
+        proposer.require_auth();
+        Self::require_owner(&env, &proposer)?;
+
+        if amount <= 0 {
+            return Err(MultisigError::InvalidAmount);
+        }
+
+        let proposal_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextProposalId)
+            .unwrap_or(0u64);
+
+        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
+        let approved_at = if 1 >= threshold {
+            Some(env.ledger().timestamp())
+        } else {
+            None
+        };
+
+        let proposal = Proposal {
+            proposer: proposer.clone(),
+            to: to.clone(),
+            token: xlm_token.clone(),
+            amount,
+            approval_count: 1,
+            rejection_count: 0,
+            approved_at,
+            executed: false,
+            cancelled: false,
+            is_native: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::HasApproved(proposal_id, proposer.clone()), &true);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextProposalId, &(proposal_id + 1));
+
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::NextProposalId, 31536000, 31536000);
+
+        // If threshold was met immediately (threshold=1), commit the amount now
+        if approved_at.is_some() {
+            let committed: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CommittedAmount(xlm_token.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::CommittedAmount(xlm_token.clone()), &(committed + amount));
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "proposal_created"),),
+            (proposal_id, &proposer, &to, &xlm_token, amount),
         );
 
         Ok(proposal_id)
@@ -480,7 +590,10 @@ impl MultisigContract {
 
         let token_client = token::Client::new(&env, &proposal.token);
 
-        // Verify the treasury holds enough to cover all committed proposals
+        // Verify the treasury holds enough to cover all committed proposals.
+        // For both token and native XLM proposals the transfer goes through
+        // token::Client. Native XLM proposals store the native asset SAC address
+        // in `proposal.token`, so the call is identical in both cases.
         let committed: i128 = env
             .storage()
             .instance()
@@ -1587,6 +1700,7 @@ mod tests {
     #[test]
     fn test_propose_emits_event() {
         use soroban_sdk::testutils::Events;
+        use soroban_sdk::TryFromVal;
         let env = Env::default();
         env.mock_all_auths();
         let (client, o1, _, _) = setup_2of3(&env);
@@ -1619,7 +1733,7 @@ mod tests {
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 1000);
 
-        let (client, o1, o2, o3) = setup_1of3_funded(&env);
+        let (client, o1, o2, o3, _, _) = setup_1of3_funded(&env);
         let token = Address::generate(&env);
         let to = Address::generate(&env);
 
@@ -1654,6 +1768,7 @@ mod tests {
     #[test]
     fn test_approve_emits_event() {
         use soroban_sdk::testutils::Events;
+        use soroban_sdk::TryFromVal;
         let env = Env::default();
         env.mock_all_auths();
         let (client, o1, o2, _) = setup_2of3(&env);
@@ -1681,6 +1796,7 @@ mod tests {
     #[test]
     fn test_reject_emits_event() {
         use soroban_sdk::testutils::Events;
+        use soroban_sdk::TryFromVal;
         let env = Env::default();
         env.mock_all_auths();
         let (client, o1, o2, _) = setup_2of3(&env);
@@ -1709,7 +1825,7 @@ mod tests {
     fn test_reject_on_cancelled_proposal_reverts() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, o1, o2, o3) = setup_2of3(&env);
+        let (client, o1, o2, _o3) = setup_2of3(&env);
         let token = Address::generate(&env);
         let to = Address::generate(&env);
 
@@ -1732,7 +1848,7 @@ mod tests {
     fn test_proposer_can_cancel_own_proposal() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, o1, o2, o3) = setup_2of3(&env);
+        let (client, o1, _o2, _o3) = setup_2of3(&env);
         let token = Address::generate(&env);
         let to = Address::generate(&env);
 
@@ -1775,7 +1891,7 @@ mod tests {
     fn test_non_proposer_cannot_cancel_active_proposal() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, o1, o2, o3) = setup_2of3(&env);
+        let (client, o1, o2, _o3) = setup_2of3(&env);
         let token = Address::generate(&env);
         let to = Address::generate(&env);
 
@@ -1795,7 +1911,7 @@ mod tests {
     fn test_cancel_already_cancelled_proposal_reverts() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, o1, o2, o3) = setup_2of3(&env);
+        let (client, o1, _o2, _o3) = setup_2of3(&env);
         let token = Address::generate(&env);
         let to = Address::generate(&env);
 
@@ -1845,6 +1961,7 @@ mod tests {
     #[test]
     fn test_execute_emits_event() {
         use soroban_sdk::testutils::Events;
+        use soroban_sdk::TryFromVal;
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|l| l.timestamp = 0);
@@ -2091,5 +2208,134 @@ mod tests {
         let result = client.try_execute(&o1, &pid);
         assert!(result.is_ok(), "execute should succeed with exact balance");
         assert!(client.get_proposal(&pid).unwrap().executed);
+    }
+
+    // ── Native XLM proposal tests ─────────────────────────────────────────────
+
+    /// Helper: 2-of-3 multisig with zero timelock, funded with native XLM via SAC.
+    fn setup_xlm_funded<'a>(
+        env: &'a Env,
+    ) -> (MultisigContractClient<'a>, [Address; 3], Address, Address, Address) {
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(env, &contract_id);
+        let o1 = Address::generate(env);
+        let o2 = Address::generate(env);
+        let o3 = Address::generate(env);
+        client.initialize(&vec![env, o1.clone(), o2.clone(), o3.clone()], &2, &0);
+
+        let xlm_sac = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(env, &xlm_sac)
+            .mint(&contract_id, &1_000_000_000); // 100 XLM in stroops
+
+        let recipient = Address::generate(env);
+        (client, [o1, o2, o3], xlm_sac, recipient, contract_id)
+    }
+
+    /// propose_xlm() creates a proposal with is_native=true and correct fields.
+    #[test]
+    fn test_propose_xlm_creates_native_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (client, [o1, _, _], xlm_sac, recipient, _) = setup_xlm_funded(&env);
+
+        let amount: i128 = 100_000_000; // 10 XLM
+        let pid = client.propose_xlm(&o1, &recipient, &xlm_sac, &amount);
+
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.is_native, "proposal must be marked as native XLM");
+        assert_eq!(proposal.token, xlm_sac);
+        assert_eq!(proposal.to, recipient);
+        assert_eq!(proposal.amount, amount);
+        assert_eq!(proposal.approval_count, 1); // proposer auto-approves
+        assert!(!proposal.executed);
+        assert!(!proposal.cancelled);
+    }
+
+    /// Full flow: propose_xlm → approve → execute transfers XLM to recipient.
+    #[test]
+    fn test_propose_xlm_approve_execute_transfers_xlm() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (client, [o1, o2, o3], xlm_sac, recipient, _) = setup_xlm_funded(&env);
+
+        let amount: i128 = 100_000_000; // 10 XLM
+        let pid = client.propose_xlm(&o1, &recipient, &xlm_sac, &amount);
+
+        // o2 approves — threshold=2 reached
+        client.approve(&o2, &pid);
+        assert!(client.get_proposal(&pid).unwrap().approved_at.is_some());
+
+        // execute (zero timelock — no advance needed)
+        client.execute(&o3, &pid);
+
+        // recipient received the XLM
+        let token_client = soroban_sdk::token::Client::new(&env, &xlm_sac);
+        assert_eq!(token_client.balance(&recipient), amount);
+        assert!(client.get_proposal(&pid).unwrap().executed);
+    }
+
+    /// propose_xlm() by a non-owner must revert with Unauthorized.
+    #[test]
+    fn test_propose_xlm_non_owner_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, xlm_sac, recipient, _) = setup_xlm_funded(&env);
+        let non_owner = Address::generate(&env);
+
+        let result = client.try_propose_xlm(&non_owner, &recipient, &xlm_sac, &100_000_000);
+        assert_eq!(result, Err(Ok(MultisigError::Unauthorized)));
+    }
+
+    /// propose_xlm() with amount=0 must revert with InvalidAmount.
+    #[test]
+    fn test_propose_xlm_zero_amount_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, [o1, _, _], xlm_sac, recipient, _) = setup_xlm_funded(&env);
+
+        let result = client.try_propose_xlm(&o1, &recipient, &xlm_sac, &0);
+        assert_eq!(result, Err(Ok(MultisigError::InvalidAmount)));
+    }
+
+    /// A regular token proposal and a native XLM proposal can coexist and both
+    /// execute correctly — is_native does not bleed across proposals.
+    #[test]
+    fn test_token_and_xlm_proposals_coexist() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (client, [o1, o2, o3], xlm_sac, recipient, contract_id) = setup_xlm_funded(&env);
+
+        // Also fund the contract with a regular token
+        let token_id = env
+            .register_stellar_asset_contract_v2(Address::generate(&env))
+            .address();
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id)
+            .mint(&contract_id, &500);
+
+        // Token proposal
+        let pid_token = client.propose(&o1, &recipient, &token_id, &200);
+        client.approve(&o2, &pid_token);
+
+        // XLM proposal
+        let pid_xlm = client.propose_xlm(&o1, &recipient, &xlm_sac, &50_000_000);
+        client.approve(&o2, &pid_xlm);
+
+        // Verify is_native is set correctly on each
+        assert!(!client.get_proposal(&pid_token).unwrap().is_native);
+        assert!(client.get_proposal(&pid_xlm).unwrap().is_native);
+
+        // Execute both
+        client.execute(&o3, &pid_token);
+        client.execute(&o3, &pid_xlm);
+
+        let token_client = soroban_sdk::token::Client::new(&env, &token_id);
+        let xlm_client = soroban_sdk::token::Client::new(&env, &xlm_sac);
+        assert_eq!(token_client.balance(&recipient), 200);
+        assert_eq!(xlm_client.balance(&recipient), 50_000_000);
     }
 }
