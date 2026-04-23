@@ -1046,6 +1046,44 @@ mod tests {
     }
 
     #[test]
+    fn test_proposal_ids_are_sequential_with_no_gaps() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let client = setup(&env);
+
+        let proposer = Address::generate(&env);
+
+        // Create 5 proposals and capture returned IDs
+        let titles = ["Proposal 0", "Proposal 1", "Proposal 2", "Proposal 3", "Proposal 4"];
+        let descs  = ["Desc 0",     "Desc 1",     "Desc 2",     "Desc 3",     "Desc 4"];
+        let mut ids = [0u64; 5];
+        for i in 0..5 {
+            ids[i] = client.propose(
+                &proposer,
+                &String::from_str(&env, titles[i]),
+                &String::from_str(&env, descs[i]),
+            );
+        }
+
+        // IDs must be exactly 0..4 in order — no gaps, starting from 0
+        assert_eq!(ids, [0u64, 1, 2, 3, 4]);
+
+        // Count must reflect all 5 proposals
+        assert_eq!(client.get_proposal_count(), 5);
+
+        // Every proposal must be retrievable and have the correct proposer
+        for id in 0u64..5 {
+            let proposal = client.get_proposal(&id);
+            assert_eq!(proposal.proposer, proposer);
+        }
+
+        // One past the last ID must return ProposalNotFound
+        let result = client.try_get_proposal(&5u64);
+        assert!(matches!(result, Err(Ok(GovernorError::ProposalNotFound))));
+    }
+
+    #[test]
     fn test_quorum_not_reached_fails() {
         let env = Env::default();
         env.mock_all_auths();
