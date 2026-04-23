@@ -42,6 +42,12 @@ Soroban charges fees based on:
 
 ---
 
+## API Design
+
+All `get_*` query functions that look up a resource by ID return `Result<T, Error>` rather than `Option<T>`. For example, `get_proposal()` returns `Err(MultisigError::ProposalNotFound)` when no proposal exists for the given ID. This is consistent with `forge-governor` and other Forge contracts, so integrators can handle missing resources uniformly across the suite.
+
+---
+
 ## Known Limitations
 
 - Owner list is fixed after initialization

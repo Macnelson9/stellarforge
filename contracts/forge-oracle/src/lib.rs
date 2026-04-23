@@ -675,6 +675,53 @@ mod tests {
         assert!(result.is_err(), "initialize must revert when signer does not control the admin address");
     }
 
+    /// Verifies the two-phase auth scenario for initialize():
+    /// Phase 1 — an attacker mocks auth for the admin address but is not that address;
+    ///            require_auth() on admin fails because attacker did not sign for admin.
+    /// Phase 2 — the real admin mocks auth for their own address; require_auth() succeeds.
+    /// Post-init — get_admin() returns admin, not attacker.
+    #[test]
+    fn test_attacker_signing_for_admin_address_is_rejected() {
+        use soroban_sdk::IntoVal;
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ForgeOracle);
+        let client = ForgeOracleClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Phase 1: attacker signs, but initialize() is called with admin as the admin arg.
+        // admin.require_auth() checks that admin signed — attacker did not, so this must fail.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (&admin, 3600u64).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = client.try_initialize(&admin, &3600);
+        assert!(result.is_err(), "initialize must revert when attacker signs for admin address");
+
+        // Phase 2: admin signs for their own address — require_auth() is satisfied.
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (&admin, 3600u64).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let result = client.try_initialize(&admin, &3600);
+        assert!(result.is_ok(), "initialize must succeed when admin signs for their own address");
+
+        // Post-init: get_admin() must return admin, not attacker.
+        assert_eq!(client.get_admin(), admin, "get_admin() must return the admin address");
+        assert_ne!(client.get_admin(), attacker, "get_admin() must not return the attacker address");
+    }
+
     #[test]
     fn test_transfer_admin() {
         let env = Env::default();

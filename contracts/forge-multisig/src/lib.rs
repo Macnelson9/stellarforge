@@ -740,25 +740,26 @@ impl MultisigContract {
 
     /// Return a proposal by its ID.
     ///
-    /// Read-only; does not modify state. Returns `None` if no proposal exists
-    /// with the given ID.
+    /// Read-only; does not modify state. Returns `Err(MultisigError::ProposalNotFound)`
+    /// if no proposal exists with the given ID, consistent with the error-returning
+    /// convention used across all Forge contracts (e.g. `forge-governor`).
     ///
     /// # Parameters
     /// - `proposal_id` — The ID returned by [`propose`](Self::propose).
     ///
     /// # Returns
-    /// `Some(`[`Proposal`]`)` if found, `None` otherwise.
+    /// `Ok(`[`Proposal`]`)` if found, `Err(`[`MultisigError::ProposalNotFound`]`)` otherwise.
     ///
     /// # Example
     /// ```text
-    /// if let Some(p) = client.get_proposal(&id) {
-    ///     println!("approvals: {}", p.approval_count);
-    /// }
+    /// let proposal = client.get_proposal(&id).expect("proposal not found");
+    /// println!("approvals: {}", proposal.approval_count);
     /// ```
-    pub fn get_proposal(env: Env, proposal_id: u64) -> Option<Proposal> {
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, MultisigError> {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
+            .ok_or(MultisigError::ProposalNotFound)
     }
 
     /// Return the list of authorized owner addresses.
@@ -1674,7 +1675,10 @@ mod tests {
         let _ = client.try_propose(&non_owner, &to, &token, &500);
 
         // Proposal ID 0 must not exist
-        assert!(client.get_proposal(&0).is_none());
+        assert_eq!(
+            client.try_get_proposal(&0).unwrap_err().unwrap(),
+            MultisigError::ProposalNotFound
+        );
         // Approval count for a non-existent proposal returns 0
         assert_eq!(client.get_approval_count(&0), 0);
     }
