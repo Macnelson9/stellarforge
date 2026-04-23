@@ -2430,4 +2430,94 @@ mod tests {
             "executed must remain false when transfer fails"
         );
     }
+
+    // ── Issue #336: cancel() by non-proposer boundary — unreachable threshold ──
+
+    /// 3-of-5 multisig: verifies the exact boundary where cancel() by a non-proposer
+    /// is blocked (remaining_possible == threshold) vs allowed (remaining_possible < threshold).
+    ///
+    /// Timeline:
+    ///   o1 proposes  → approval=1, rejection=0, remaining_possible=4  (4 >= 3 → cannot cancel)
+    ///   o2 rejects   → approval=1, rejection=1, remaining_possible=3  (3 >= 3 → cannot cancel)
+    ///   o3 rejects   → approval=1, rejection=2, remaining_possible=2  (2 < 3  → can cancel)
+    ///   o4 tries cancel at remaining=2 → CannotCancel (boundary: 2 == threshold-1? No: 2 < 3)
+    ///
+    /// Wait — let's be precise per the contract logic:
+    ///   remaining_possible = total_owners - rejection_count - approval_count
+    ///   cancel allowed when remaining_possible < threshold
+    ///
+    ///   After o1 proposes (approval=1, rejection=0): remaining = 5-0-1 = 4; 4 >= 3 → CannotCancel
+    ///   After o2 rejects  (approval=1, rejection=1): remaining = 5-1-1 = 3; 3 >= 3 → CannotCancel
+    ///   After o3 rejects  (approval=1, rejection=2): remaining = 5-2-1 = 2; 2 < 3  → can cancel
+    ///   o4 attempts cancel at remaining=3 (after o2 rejects) → CannotCancel
+    ///   o4 rejects        (approval=1, rejection=3): remaining = 5-3-1 = 1; 1 < 3  → can cancel
+    ///   o5 calls cancel() → success, proposal.cancelled == true
+    #[test]
+    fn test_cancel_non_proposer_boundary_3of5() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        let o3 = Address::generate(&env);
+        let o4 = Address::generate(&env);
+        let o5 = Address::generate(&env);
+
+        // 3-of-5 multisig, zero timelock
+        client.initialize(
+            &vec![&env, o1.clone(), o2.clone(), o3.clone(), o4.clone(), o5.clone()],
+            &3,
+            &0,
+        );
+
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        // o1 proposes — auto-approves (approval=1, rejection=0, remaining=4)
+        let pid = client.propose(&o1, &to, &token, &100);
+        {
+            let p = client.get_proposal(&pid).unwrap();
+            assert_eq!(p.approval_count, 1);
+            assert_eq!(p.rejection_count, 0);
+        }
+
+        // o2 rejects → rejection=1, remaining = 5-1-1 = 3; 3 >= 3 → CannotCancel
+        client.reject(&o2, &pid);
+        {
+            let p = client.get_proposal(&pid).unwrap();
+            assert_eq!(p.rejection_count, 1);
+        }
+        // o4 attempts cancel at this point — remaining=3 == threshold → CannotCancel
+        let result = client.try_cancel(&o4, &pid);
+        assert_eq!(
+            result,
+            Err(Ok(MultisigError::CannotCancel)),
+            "cancel must fail when remaining_possible == threshold (3 == 3)"
+        );
+
+        // o3 rejects → rejection=2, remaining = 5-2-1 = 2; 2 < 3 → can cancel
+        client.reject(&o3, &pid);
+        {
+            let p = client.get_proposal(&pid).unwrap();
+            assert_eq!(p.rejection_count, 2);
+        }
+
+        // o4 rejects → rejection=3, remaining = 5-3-1 = 1; 1 < 3 → can cancel
+        client.reject(&o4, &pid);
+        {
+            let p = client.get_proposal(&pid).unwrap();
+            assert_eq!(p.rejection_count, 3);
+        }
+
+        // o5 calls cancel() — remaining=1 < threshold=3 → success
+        let result = client.try_cancel(&o5, &pid);
+        assert!(result.is_ok(), "cancel must succeed when threshold is unreachable");
+
+        // Verify proposal is cancelled
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.cancelled, "proposal.cancelled must be true after successful cancel");
+    }
 }

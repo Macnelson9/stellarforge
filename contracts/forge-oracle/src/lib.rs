@@ -1398,4 +1398,69 @@ mod tests {
         let result = client.try_submit_price(&base, &quote, &100_000_000);
         assert!(result.is_ok());
     }
+
+    // ── Issue #337: set_max_price_deviation end-to-end flow ──────────────────
+
+    /// Full end-to-end test for set_max_price_deviation():
+    ///   1. Submit initial price of 10_000_000 (1.0 USDC)
+    ///   2. Set max deviation to 1000 bps (10%)
+    ///   3. 11.1% increase (11_100_000) → PriceDeviationTooHigh
+    ///   4. 9% increase (10_900_000) → success
+    ///   5. 17% decrease from 10_900_000 → 9_000_000 → PriceDeviationTooHigh
+    ///   6. set_max_price_deviation(0) disables check → previously blocked price now succeeds
+    #[test]
+    fn test_set_max_price_deviation_end_to_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (_, client) = setup(&env); // staleness = 3600
+
+        let base = Symbol::new(&env, "XLM");
+        let quote = Symbol::new(&env, "USDC");
+
+        // Step 1: submit initial price of 10_000_000 (1.0 USDC)
+        client.submit_price(&base, &quote, &10_000_000);
+        let data = client.get_price_unsafe(&base, &quote);
+        assert_eq!(data.price, 10_000_000);
+
+        // Step 2: set max deviation to 1000 bps (10%)
+        client.set_max_price_deviation(&1000);
+
+        // Step 3: 11.1% increase → 11_100_000; deviation = (1_100_000 * 10_000) / 10_000_000 = 1100 bps > 1000 → blocked
+        let result = client.try_submit_price(&base, &quote, &11_100_000);
+        assert_eq!(
+            result,
+            Err(Ok(OracleError::PriceDeviationTooHigh)),
+            "11.1% increase must be blocked by 10% circuit breaker"
+        );
+        // Price must remain unchanged
+        assert_eq!(client.get_price_unsafe(&base, &quote).price, 10_000_000);
+
+        // Step 4: 9% increase → 10_900_000; deviation = (900_000 * 10_000) / 10_000_000 = 900 bps <= 1000 → accepted
+        let result = client.try_submit_price(&base, &quote, &10_900_000);
+        assert!(result.is_ok(), "9% increase must be accepted within 10% threshold");
+        assert_eq!(client.get_price_unsafe(&base, &quote).price, 10_900_000);
+
+        // Step 5: 17% decrease from 10_900_000 → 9_000_000
+        // deviation = (1_900_000 * 10_000) / 10_900_000 ≈ 1743 bps > 1000 → blocked
+        let result = client.try_submit_price(&base, &quote, &9_000_000);
+        assert_eq!(
+            result,
+            Err(Ok(OracleError::PriceDeviationTooHigh)),
+            "17% decrease must be blocked by 10% circuit breaker"
+        );
+        // Price must remain at 10_900_000
+        assert_eq!(client.get_price_unsafe(&base, &quote).price, 10_900_000);
+
+        // Step 6: disable circuit breaker by setting bps = 0
+        client.set_max_price_deviation(&0);
+
+        // Previously blocked price (9_000_000) must now succeed
+        let result = client.try_submit_price(&base, &quote, &9_000_000);
+        assert!(
+            result.is_ok(),
+            "previously blocked price must succeed after disabling circuit breaker"
+        );
+        assert_eq!(client.get_price_unsafe(&base, &quote).price, 9_000_000);
+    }
 }

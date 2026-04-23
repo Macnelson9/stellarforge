@@ -3064,4 +3064,165 @@ mod tests {
         assert_eq!(status.withdrawable, 20_000, "20,000 tokens accrued before pause");
         assert!(status.is_claimable, "paused stream with accrued tokens must be claimable");
     }
+
+    // ── Issue #338: extend_stream() comprehensive coverage ───────────────────
+
+    /// At t=500 (halfway), extend by 500 additional seconds.
+    /// Verifies end_time, remaining, active at original end, finished at new end,
+    /// and sender balance decreases by additional_seconds * rate at extension time.
+    #[test]
+    fn test_extend_stream_halfway_comprehensive() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let rate: i128 = 100;
+        let duration: u64 = 1000;
+        let total = rate * duration as i128; // 100_000
+        let additional_seconds: u64 = 500;
+        let additional_tokens = rate * additional_seconds as i128; // 50_000
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let sac = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        let token_client = soroban_sdk::token::Client::new(&env, &token_id);
+
+        // Mint enough for original stream + extension
+        sac.mint(&sender, &(total + additional_tokens));
+
+        let stream_id = client.create_stream(&sender, &token_id, &recipient, &rate, &duration);
+        let original_end_time = client.get_stream(&stream_id).end_time;
+        assert_eq!(original_end_time, 1000);
+
+        // At t=500 (halfway), extend by 500 seconds
+        env.ledger().with_mut(|l| l.timestamp = 500);
+        let sender_balance_before = token_client.balance(&sender);
+        client.extend_stream(&stream_id, &additional_seconds);
+        let sender_balance_after = token_client.balance(&sender);
+
+        // Assert end_time = original_end_time + 500
+        let stream = client.get_stream(&stream_id);
+        assert_eq!(
+            stream.end_time,
+            original_end_time + additional_seconds,
+            "end_time must equal original_end_time + additional_seconds"
+        );
+
+        // Assert sender balance decreased by additional_seconds * rate
+        assert_eq!(
+            sender_balance_before - sender_balance_after,
+            additional_tokens,
+            "sender balance must decrease by additional_seconds * rate at extension"
+        );
+
+        // Assert remaining reflects extended total
+        let status = client.get_stream_status(&stream_id);
+        // streamed at t=500 = 100 * 500 = 50_000; new total = 100 * 1500 = 150_000
+        // remaining = 150_000 - 50_000 = 100_000
+        assert_eq!(
+            status.remaining, 100_000,
+            "remaining must reflect extended total minus already streamed"
+        );
+
+        // Advance to original end_time (1000) — stream must still be active
+        env.ledger().with_mut(|l| l.timestamp = 1000);
+        let status_at_original_end = client.get_stream_status(&stream_id);
+        assert!(
+            status_at_original_end.is_active,
+            "stream must still be active at original end_time after extension"
+        );
+        assert!(
+            !status_at_original_end.is_finished,
+            "stream must not be finished at original end_time after extension"
+        );
+
+        // Advance to new end_time (1500) — stream must be finished
+        env.ledger().with_mut(|l| l.timestamp = 1500);
+        let status_at_new_end = client.get_stream_status(&stream_id);
+        assert!(
+            status_at_new_end.is_finished,
+            "stream must be finished at new end_time"
+        );
+        assert_eq!(
+            status_at_new_end.withdrawable,
+            total + additional_tokens,
+            "full extended total must be withdrawable at new end_time"
+        );
+    }
+
+    /// Extending a cancelled stream must revert with AlreadyCancelled.
+    #[test]
+    fn test_extend_cancelled_stream_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token = setup_token(&env, &sender, 200_000);
+
+        let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
+        client.cancel_stream(&stream_id);
+
+        let result = client.try_extend_stream(&stream_id, &500);
+        assert_eq!(
+            result,
+            Err(Ok(StreamError::AlreadyCancelled)),
+            "extending a cancelled stream must revert with AlreadyCancelled"
+        );
+    }
+
+    /// Extending after end_time must revert with StreamFinished.
+    #[test]
+    fn test_extend_after_end_time_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token = setup_token(&env, &sender, 200_000);
+
+        let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
+
+        // Advance past end_time
+        env.ledger().with_mut(|l| l.timestamp = 1001);
+
+        let result = client.try_extend_stream(&stream_id, &500);
+        assert_eq!(
+            result,
+            Err(Ok(StreamError::StreamFinished)),
+            "extending after end_time must revert with StreamFinished"
+        );
+    }
+
+    /// Extending with additional_seconds = 0 must revert with InvalidConfig.
+    #[test]
+    fn test_extend_zero_seconds_reverts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let contract_id = env.register_contract(None, ForgeStream);
+        let client = ForgeStreamClient::new(&env, &contract_id);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let token = setup_token(&env, &sender, 100_000);
+
+        let stream_id = client.create_stream(&sender, &token, &recipient, &100, &1000);
+
+        let result = client.try_extend_stream(&stream_id, &0);
+        assert_eq!(
+            result,
+            Err(Ok(StreamError::InvalidConfig)),
+            "extending with 0 additional_seconds must revert with InvalidConfig"
+        );
+    }
 }

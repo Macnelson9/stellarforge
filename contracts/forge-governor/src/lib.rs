@@ -2793,4 +2793,88 @@ mod tests {
         // Proposal 999 was never created
         assert_eq!(client.get_vote_weight(&999, &voter), None);
     }
+
+    // ── Issue #335: abstain votes count toward quorum but not toward passing ──
+
+    /// Scenario 1: 100 abstain votes meet quorum (100) but proposal fails because
+    /// votes_for (0) is not > votes_against (0).
+    #[test]
+    fn test_abstain_only_quorum_met_proposal_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        // setup_with_token uses quorum = 100, voting_period = 3600
+        let (client, token_id) = setup_with_token(&env);
+
+        let proposer = Address::generate(&env);
+        let abstainer = Address::generate(&env);
+        mint(&env, &token_id, &abstainer, 100);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "Abstain Only Quorum"),
+            &String::from_str(&env, "100 abstain, 0 for, 0 against"),
+        );
+
+        // Cast exactly 100 abstain votes — meets quorum but no for/against
+        client.vote(&abstainer, &pid, &VoteDirection::Abstain, &100);
+
+        // Advance past voting period
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        let state = client.finalize(&pid);
+
+        // Quorum met (100 >= 100) but votes_for (0) not > votes_against (0) → Failed
+        assert_eq!(
+            state,
+            ProposalState::Failed,
+            "proposal must fail when quorum is met only via abstentions"
+        );
+
+        // Verify tally
+        let tally = client.get_vote_tally(&pid);
+        assert_eq!(tally.abstain_votes, 100);
+        assert_eq!(tally.yes_votes, 0);
+        assert_eq!(tally.no_votes, 0);
+        assert_eq!(tally.total_votes, 100);
+    }
+
+    /// Scenario 2: 51 for + 49 abstain = 100 total meets quorum and yes majority → Passed.
+    #[test]
+    fn test_for_plus_abstain_meets_quorum_and_passes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (client, token_id) = setup_with_token(&env);
+
+        let proposer = Address::generate(&env);
+        let yes_voter = Address::generate(&env);
+        let abstainer = Address::generate(&env);
+        mint(&env, &token_id, &yes_voter, 51);
+        mint(&env, &token_id, &abstainer, 49);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "For + Abstain Quorum"),
+            &String::from_str(&env, "51 for + 49 abstain = 100 total"),
+        );
+
+        client.vote(&yes_voter, &pid, &VoteDirection::For, &51);
+        client.vote(&abstainer, &pid, &VoteDirection::Abstain, &49);
+
+        env.ledger().with_mut(|l| l.timestamp = 5000);
+        let state = client.finalize(&pid);
+
+        // Total = 100 >= quorum, votes_for (51) > votes_against (0) → Passed
+        assert_eq!(
+            state,
+            ProposalState::Passed,
+            "proposal must pass when quorum met and yes majority achieved via for+abstain"
+        );
+
+        let tally = client.get_vote_tally(&pid);
+        assert_eq!(tally.yes_votes, 51);
+        assert_eq!(tally.no_votes, 0);
+        assert_eq!(tally.abstain_votes, 49);
+        assert_eq!(tally.total_votes, 100);
+    }
 }
