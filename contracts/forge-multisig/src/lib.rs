@@ -939,6 +939,48 @@ mod tests {
         assert!(proposal.approved_at.is_some());
     }
 
+    /// TC: propose() with amount = 0 must return InvalidAmount and leave no proposal.
+    #[test]
+    fn test_propose_zero_amount_returns_invalid_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, _, _) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let result = client.try_propose(&o1, &to, &token, &0);
+        assert_eq!(result, Err(Ok(MultisigError::InvalidAmount)));
+        assert!(client.get_proposal(&0).is_none());
+    }
+
+    /// TC: propose() with amount = -1 must return InvalidAmount and leave no proposal.
+    #[test]
+    fn test_propose_negative_amount_returns_invalid_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, _, _) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let result = client.try_propose(&o1, &to, &token, &-1);
+        assert_eq!(result, Err(Ok(MultisigError::InvalidAmount)));
+        assert!(client.get_proposal(&0).is_none());
+    }
+
+    /// TC: propose() with amount = 1 must succeed and create a proposal.
+    #[test]
+    fn test_propose_minimum_valid_amount_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, o1, _, _) = setup_2of3(&env);
+        let token = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        let pid = client.propose(&o1, &to, &token, &1);
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert_eq!(proposal.amount, 1);
+    }
+
     #[test]
     fn test_double_vote_fails() {
         let env = Env::default();
