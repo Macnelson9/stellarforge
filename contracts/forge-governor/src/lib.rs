@@ -401,7 +401,7 @@ impl GovernorContract {
             VoteDirection::Abstain => proposal.abstentions += weight,
         }
 
-        env.storage().persistent().set(&vote_key, &true);
+        env.storage().persistent().set(&vote_key, &weight);
         env.storage()
             .persistent()
             .extend_ttl(&vote_key, VOTE_TTL_EXTEND, VOTE_TTL_EXTEND);
@@ -770,6 +770,30 @@ impl GovernorContract {
         env.storage()
             .persistent()
             .has(&DataKey::Vote(proposal_id, voter))
+    }
+
+    /// Return the weight a voter cast on a specific proposal.
+    ///
+    /// Looks up the persistent vote entry written by [`vote`](Self::vote).
+    /// Returns `Some(weight)` if the voter has cast a vote, or `None` if they
+    /// have not voted (or if the proposal does not exist).
+    ///
+    /// # Parameters
+    /// - `proposal_id` — ID of the proposal to query.
+    /// - `voter` — Address of the voter to look up.
+    ///
+    /// # Returns
+    /// `Some(i128)` — the weight the voter cast, or `None` if no vote was found.
+    ///
+    /// # Example
+    /// ```text
+    /// let weight = client.get_vote_weight(&proposal_id, &voter_address);
+    /// assert_eq!(weight, Some(500));
+    /// ```
+    pub fn get_vote_weight(env: Env, proposal_id: u64, voter: Address) -> Option<i128> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Vote(proposal_id, voter))
     }
 
     /// Return the current state of a proposal.
@@ -2703,5 +2727,70 @@ mod tests {
         assert_eq!(stored.voting_period, 7200);
         assert_eq!(stored.quorum, 50);
         assert_eq!(stored.timelock_delay, 43200);
+    }
+
+    #[test]
+    fn test_get_vote_weight_returns_correct_weight_after_voting() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (client, token_id) = setup_with_token(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        mint(&env, &token_id, &voter, 500);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+
+        // Before voting, weight should be None
+        assert_eq!(client.get_vote_weight(&pid, &voter), None);
+
+        client.vote(&voter, &pid, &VoteDirection::For, &500);
+
+        // After voting, weight should match what was cast
+        assert_eq!(client.get_vote_weight(&pid, &voter), Some(500));
+    }
+
+    #[test]
+    fn test_get_vote_weight_returns_none_for_non_voter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let (client, token_id) = setup_with_token(&env);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let non_voter = Address::generate(&env);
+        mint(&env, &token_id, &voter, 100);
+
+        let pid = client.propose(
+            &proposer,
+            &String::from_str(&env, "P"),
+            &String::from_str(&env, "D"),
+        );
+
+        client.vote(&voter, &pid, &VoteDirection::Against, &75);
+
+        // voter's weight is stored
+        assert_eq!(client.get_vote_weight(&pid, &voter), Some(75));
+        // non_voter never voted — must return None
+        assert_eq!(client.get_vote_weight(&pid, &non_voter), None);
+    }
+
+    #[test]
+    fn test_get_vote_weight_returns_none_for_nonexistent_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        let client = setup(&env);
+
+        let voter = Address::generate(&env);
+
+        // Proposal 999 was never created
+        assert_eq!(client.get_vote_weight(&999, &voter), None);
     }
 }
