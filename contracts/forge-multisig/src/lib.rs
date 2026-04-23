@@ -247,9 +247,10 @@ impl MultisigContract {
                 .instance()
                 .get(&DataKey::CommittedAmount(token.clone()))
                 .unwrap_or(0);
-            env.storage()
-                .instance()
-                .set(&DataKey::CommittedAmount(token.clone()), &(committed + amount));
+            env.storage().instance().set(
+                &DataKey::CommittedAmount(token.clone()),
+                &(committed + amount),
+            );
         }
 
         env.events().publish(
@@ -351,9 +352,10 @@ impl MultisigContract {
                 .instance()
                 .get(&DataKey::CommittedAmount(xlm_token.clone()))
                 .unwrap_or(0);
-            env.storage()
-                .instance()
-                .set(&DataKey::CommittedAmount(xlm_token.clone()), &(committed + amount));
+            env.storage().instance().set(
+                &DataKey::CommittedAmount(xlm_token.clone()),
+                &(committed + amount),
+            );
         }
 
         env.events().publish(
@@ -1339,6 +1341,94 @@ mod tests {
         assert_eq!(proposal.rejection_count, 2);
     }
 
+    /// Test mixed approval/rejection scenario where threshold is still reached
+    ///
+    /// Steps:
+    /// 1. Set up 2-of-3 multisig with owners o1, o2, o3
+    /// 2. o1 proposes (auto-approves, 1 approval)
+    /// 3. o2 rejects (1 approval, 1 rejection)
+    /// 4. o3 approves — threshold of 2 is now reached
+    /// 5. Assert proposal.approved_at is set after o3 approves
+    /// 6. Advance past timelock and execute — assert success
+    /// 7. Verify token balances are correct
+    #[test]
+    fn test_mixed_approval_rejection_threshold_reached() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 0);
+
+        let contract_id = env.register_contract(None, MultisigContract);
+        let client = MultisigContractClient::new(&env, &contract_id);
+        let o1 = Address::generate(&env);
+        let o2 = Address::generate(&env);
+        let o3 = Address::generate(&env);
+
+        // 2-of-3 multisig with 3600s timelock
+        client.initialize(&vec![&env, o1.clone(), o2.clone(), o3.clone()], &2, &3600);
+
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+        let recipient = Address::generate(&env);
+
+        // Mint tokens to the contract treasury
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &1000);
+
+        // Record initial balances
+        let initial_contract_balance =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token_id).balance(&contract_id);
+        let initial_recipient_balance =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token_id).balance(&recipient);
+
+        // o1 proposes (auto-approves, 1 approval)
+        let pid = client.propose(&o1, &recipient, &token_id, &500);
+
+        // Verify initial state: 1 approval, 0 rejections, approved_at = None
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert_eq!(proposal.approval_count, 1);
+        assert_eq!(proposal.rejection_count, 0);
+        assert_eq!(proposal.approved_at, None);
+
+        // o2 rejects (1 approval, 1 rejection)
+        client.reject(&o2, &pid);
+
+        // Verify state after rejection: still 1 approval, 1 rejection, approved_at = None
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert_eq!(proposal.approval_count, 1);
+        assert_eq!(proposal.rejection_count, 1);
+        assert_eq!(proposal.approved_at, None);
+
+        // o3 approves — threshold of 2 is now reached
+        client.approve(&o3, &pid);
+
+        // Verify state after o3 approves: 2 approvals, 1 rejection, approved_at is set
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert_eq!(proposal.approval_count, 2);
+        assert_eq!(proposal.rejection_count, 1);
+        assert!(proposal.approved_at.is_some());
+        assert_eq!(proposal.approved_at.unwrap(), 0); // Should be set to current timestamp
+
+        // Advance past timelock (3600s)
+        env.ledger().with_mut(|l| l.timestamp = 7200);
+
+        // Execute should succeed
+        client.execute(&o1, &pid);
+
+        // Verify proposal is executed
+        let proposal = client.get_proposal(&pid).unwrap();
+        assert!(proposal.executed);
+
+        // Verify token balances are correct
+        let final_contract_balance =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token_id).balance(&contract_id);
+        let final_recipient_balance =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token_id).balance(&recipient);
+
+        assert_eq!(final_contract_balance, initial_contract_balance - 500);
+        assert_eq!(final_recipient_balance, initial_recipient_balance + 500);
+    }
+
     #[test]
     fn test_rejected_proposal_state_immutable() {
         let env = Env::default();
@@ -2269,7 +2359,13 @@ mod tests {
     /// Helper: 2-of-3 multisig with zero timelock, funded with native XLM via SAC.
     fn setup_xlm_funded<'a>(
         env: &'a Env,
-    ) -> (MultisigContractClient<'a>, [Address; 3], Address, Address, Address) {
+    ) -> (
+        MultisigContractClient<'a>,
+        [Address; 3],
+        Address,
+        Address,
+        Address,
+    ) {
         let contract_id = env.register_contract(None, MultisigContract);
         let client = MultisigContractClient::new(env, &contract_id);
         let o1 = Address::generate(env);
@@ -2368,8 +2464,7 @@ mod tests {
         let token_id = env
             .register_stellar_asset_contract_v2(Address::generate(&env))
             .address();
-        soroban_sdk::token::StellarAssetClient::new(&env, &token_id)
-            .mint(&contract_id, &500);
+        soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&contract_id, &500);
 
         // Token proposal
         let pid_token = client.propose(&o1, &recipient, &token_id, &200);
