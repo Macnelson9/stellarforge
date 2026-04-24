@@ -153,62 +153,73 @@ The tables below are verified against the current contract code in `contracts/*/
 
 ## 🛠️ Prerequisites & Setup
 
-Soroban is Stellar’s smart contract platform, built for performance and developer-friendly Rust tooling. Learn more in the [official docs](https://developers.stellar.org/docs/smart-contracts/overview).
+[Soroban](https://developers.stellar.org/docs/smart-contracts/overview) is Stellar's smart contract platform built on Rust. Follow the steps below to get your environment ready from scratch.
 
-To build and test these contracts, you will need the following tools:
+### Step 1 — Install Rust
 
-#### Rust Requirements
-- **Rust Edition:** 2021
-- **Target:** `wasm32v1-none` (v1 instruction set recommended for Soroban)
+If you don't have Rust installed, get it via [rustup](https://rustup.rs/):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Then restart your terminal (or run `source ~/.cargo/env`) so the `cargo` and `rustup` commands are available.
+
+### Step 2 — Add the WebAssembly target
+
+Soroban contracts compile to WebAssembly. Add the required target:
 
 ```bash
 rustup target add wasm32v1-none
 ```
 
-#### CLI Installation
-The `stellar-cli` is essential for building, deploying, and interacting with Soroban contracts. **v25.2.0 or higher** is recommended.
+> **Why?** Soroban runs contracts as WASM binaries. The `wasm32v1-none` target tells the Rust compiler to produce WASM output compatible with the Soroban runtime.
+
+### Step 3 — Install the Stellar CLI
+
+The `stellar-cli` tool lets you build, deploy, and invoke contracts. **Version 25.2.0 or higher** is required.
 
 ```bash
 cargo install --locked stellar-cli
 ```
 
-#### Funding Testnet Accounts
-Before deploying, you'll need a funded testnet account. You can generate and fund one easily:
+Verify the installation:
 
 ```bash
-stellar keys generate <identity_name> --network testnet --fund
+stellar --version
 ```
 
-### Using Make (Recommended)
-This project includes a Makefile with common development commands:
+### Step 4 — Clone the repository
 
-| Command | Description |
-| :--- | :--- |
-| `make build` | Build all workspace crates |
-| `make test` | Run all tests |
-| `make lint` | Run clippy linter with deny warnings |
-| `make fmt` | Format code |
-| `make check` | Run fmt + lint + test in sequence |
-| `make clean` | Clean build artifacts |
+```bash
+git clone https://github.com/Austinaminu2/stellarforge.git
+cd stellarforge
+```
 
-### Build all contracts
+### Step 5 — Build the contracts
 
 ```bash
 make build
-# or manually:
+```
+
+<details>
+<summary>Run without Make</summary>
+
+```bash
 cargo build --workspace
 stellar contract build
 ```
 
-### Run all tests
+</details>
+
+### Step 6 — Run the tests
 
 ```bash
 make test
-# or manually:
-cargo test --workspace
 ```
 
-### Run a specific contract's tests
+<details>
+<summary>Run a single contract’s tests</summary>
 
 ```bash
 cargo test -p forge-vesting
@@ -218,6 +229,30 @@ cargo test -p forge-governor
 cargo test -p forge-oracle
 ```
 
+</details>
+
+### Step 7 — (Optional) Fund a testnet account
+
+If you want to deploy contracts to Stellar testnet, generate and fund a test identity:
+
+```bash
+stellar keys generate <your-identity-name> --network testnet --fund
+```
+
+Replace `<your-identity-name>` with any label you like (e.g. `alice`). The `--fund` flag automatically requests test tokens from the Stellar Friendbot.
+
+---
+
+### Make command reference
+
+| Command | Description |
+| :--- | :--- |
+| `make build` | Build all workspace crates |
+| `make test` | Run all tests |
+| `make lint` | Run clippy linter with deny warnings |
+| `make fmt` | Format code |
+| `make check` | Run fmt + lint + test in sequence |
+| `make clean` | Clean build artifacts |
 ---
 
 ## 🚀 Testnet Deployment
